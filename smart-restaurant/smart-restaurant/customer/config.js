@@ -5,8 +5,8 @@
  * or "secret" key here.
  */
 window.SMART_RESTAURANT_CONFIG = {
-  SUPABASE_URL: "https://YOUR-PROJECT-REF.supabase.co",
-  SUPABASE_ANON_KEY: "YOUR-ANON-PUBLIC-KEY",
+  SUPABASE_URL: "https://vfhbgolnzbzqsnjovvku.supabase.co",
+  SUPABASE_ANON_KEY: "sb_publishable_iLac-2-_2fWmFHob5TVrWw_976f3KjY",
   // Set to true only after deploying the "ai-assistant" Edge Function and
   // switching AI on in the dashboard (Super Admin -> AI Assistant).
   ENABLE_AI: false
