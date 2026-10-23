@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <!-- The page address contains the table's secret code: never leak it to other sites. -->
+  <meta name="referrer" content="no-referrer">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#059669">
+  <title>Menu</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <noscript><p class="fatal">Please turn on JavaScript to see the menu and place your order.</p></noscript>
+
+  <div id="app" hidden>
+    <header class="top">
+      <img id="logo" class="logo" alt="" hidden referrerpolicy="no-referrer">
+      <div class="top-text">
+        <h1 id="restName"></h1>
+        <p id="tableName" class="muted"></p>
+      </div>
+    </header>
+
+    <nav class="tabs" role="tablist" aria-label="Sections">
+      <button role="tab" id="tab-menu" data-tab="menu" aria-selected="true" aria-controls="view-menu">Menu</button>
+      <button role="tab" id="tab-suggest" data-tab="suggest" aria-selected="false" aria-controls="view-suggest">Ideas</button>
+      <button role="tab" id="tab-orders" data-tab="orders" aria-selected="false" aria-controls="view-orders">Orders</button>
+      <button role="tab" id="tab-help" data-tab="help" aria-selected="false" aria-controls="view-help">Help</button>
+    </nav>
+
+    <main>
+      <section id="view-menu" role="tabpanel" aria-labelledby="tab-menu">
+        <label class="sr-only" for="search">Search the menu</label>
+        <input id="search" type="search" placeholder="Search the menu" autocomplete="off" maxlength="60">
+        <div id="chips" class="chips" role="group" aria-label="Categories"></div>
+        <div id="menuList" class="list"></div>
+      </section>
+
+      <section id="view-suggest" role="tabpanel" aria-labelledby="tab-suggest" hidden>
+        <div id="suggestBody"></div>
+      </section>
+
+      <section id="view-orders" role="tabpanel" aria-labelledby="tab-orders" hidden>
+        <div id="ordersBody"></div>
+      </section>
+
+      <section id="view-help" role="tabpanel" aria-labelledby="tab-help" hidden>
+        <div id="helpBody"></div>
+      </section>
+    </main>
+
+    <div id="cartBar" class="cart-bar" hidden>
+      <button id="openCart" type="button" class="primary wide"></button>
+    </div>
+
+    <div id="sheet" class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheetTitle" hidden>
+      <div class="sheet-card">
+        <div class="sheet-head">
+          <h2 id="sheetTitle">Your order</h2>
+          <button id="closeSheet" type="button" class="icon" aria-label="Close">✕</button>
+        </div>
+        <div id="sheetBody"></div>
+      </div>
+    </div>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  </div>
+
+  <div id="fatal" class="fatal-wrap" hidden>
+    <div class="fatal">
+      <h1 id="fatalTitle">Something went wrong</h1>
+      <p id="fatalText"></p>
+      <button id="fatalRetry" type="button" class="primary" hidden>Try again</button>
+    </div>
+  </div>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

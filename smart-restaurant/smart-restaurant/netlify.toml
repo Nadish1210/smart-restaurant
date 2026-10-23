@@ -1,0 +1,3 @@
+# Netlify settings. Tells Netlify to publish only the "customer" folder.
+[build]
+  publish = "customer"
