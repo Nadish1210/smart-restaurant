@@ -270,6 +270,15 @@ create index if not exists requests_restaurant_idx on public.waiter_requests (re
 create unique index if not exists requests_one_open_per_type on public.waiter_requests (table_id, request_type)
   where status in ('pending', 'accepted', 'in_progress') and table_id is not null;
 
+-- Each table belongs to at most one waiter; a waiter may have many tables. Orders and
+-- requests from a table are credited to / handled by that table's waiter.
+alter table public.restaurant_tables
+  add column if not exists waiter_id uuid references public.restaurant_employees (id) on delete set null;
+create index if not exists tables_waiter_idx on public.restaurant_tables (waiter_id);
+alter table public.waiter_requests
+  add column if not exists waiter_id uuid references public.restaurant_employees (id) on delete set null;
+create index if not exists requests_waiter_idx on public.waiter_requests (waiter_id);
+
 create table if not exists public.inventory (
   id                 uuid primary key default gen_random_uuid(),
   restaurant_id      uuid not null references public.restaurants (id) on delete cascade,
@@ -375,6 +384,15 @@ create or replace function public.auth_restaurant_id() returns uuid
 language sql stable security definer set search_path = ''
 as $$
   select p.restaurant_id from public.profiles p where p.id = (select auth.uid()) and p.is_active
+$$;
+
+-- The caller's employee id when the caller is an active waiter (null for everyone else).
+create or replace function public.auth_employee_id() returns uuid
+language sql stable security definer set search_path = ''
+as $$
+  select e.id from public.restaurant_employees e
+  join public.profiles p on p.id = e.user_id
+  where e.user_id = (select auth.uid()) and p.is_active and p.role = 'waiter' and e.is_active
 $$;
 
 create or replace function public.is_super_admin() returns boolean
@@ -489,9 +507,16 @@ end $$;
 create or replace function public.sync_employee_profile() returns trigger
 language plpgsql security definer set search_path = ''
 as $$
+declare v_id uuid;
 begin
   update public.profiles set is_active = new.is_active, full_name = new.full_name
   where id = new.user_id;
+  -- A deactivated waiter keeps no tables; the owner sees them as "no waiter" and assigns them again.
+  if not new.is_active then
+    for v_id in select t.id from public.restaurant_tables t where t.waiter_id = new.id loop
+      perform public._move_table(new.restaurant_id, v_id, null);
+    end loop;
+  end if;
   return new;
 end $$;
 
@@ -595,16 +620,20 @@ create policy rtables_update on public.restaurant_tables for update to authentic
   using ((select public.is_owner_of(restaurant_id)) and (select public.restaurant_is_open(restaurant_id)))
   with check ((select public.is_owner_of(restaurant_id)) and (select public.restaurant_is_open(restaurant_id)));
 
--- orders, items, requests: staff read; changes only via functions.
+-- orders, items, requests: the owner reads all; a waiter reads only the orders and requests of
+-- the tables assigned to them. Changes only via functions.
 drop policy if exists orders_select on public.orders;
 create policy orders_select on public.orders for select to authenticated
-  using ((select public.is_member_of(restaurant_id)));
+  using ((select public.is_owner_of(restaurant_id))
+         or ((select public.is_member_of(restaurant_id)) and waiter_id = (select public.auth_employee_id())));
 drop policy if exists order_items_select on public.order_items;
 create policy order_items_select on public.order_items for select to authenticated
-  using ((select public.is_member_of(restaurant_id)));
+  using ((select public.is_owner_of(restaurant_id))
+         or exists (select 1 from public.orders o where o.id = order_id));  -- orders RLS decides
 drop policy if exists requests_select on public.waiter_requests;
 create policy requests_select on public.waiter_requests for select to authenticated
-  using ((select public.is_member_of(restaurant_id)));
+  using ((select public.is_owner_of(restaurant_id))
+         or ((select public.is_member_of(restaurant_id)) and waiter_id = (select public.auth_employee_id())));
 
 -- financial records: owner only (waiters get their own figures from waiter_stats()).
 drop policy if exists inventory_select on public.inventory;
@@ -753,13 +782,21 @@ create or replace function public.update_order_status(p_order_id uuid, p_new_sta
 language plpgsql security definer set search_path = ''
 as $$
 declare
-  v_rid uuid; v_role text; o public.orders; v_next text; v_emp_id uuid; v_emp_name text;
+  v_rid uuid; v_role text; o public.orders; v_next text; v_emp uuid; v_wid uuid; v_wname text;
 begin
   v_rid := public._staff_restaurant(array['owner', 'waiter']);
   perform public._require_open(v_rid);
   select * into o from public.orders where id = p_order_id and restaurant_id = v_rid for update;
   if not found then
     raise exception 'Order not found.';
+  end if;
+  select p.role into v_role from public.profiles p where p.id = auth.uid();
+  -- A waiter may only work on orders of their own tables.
+  if v_role = 'waiter' then
+    v_emp := public.auth_employee_id();
+    if v_emp is null or o.waiter_id is distinct from v_emp then
+      raise exception 'This order belongs to another waiter''s table.';
+    end if;
   end if;
   if p_new_status = 'cancelled' then
     raise exception 'Use the cancel action to cancel an order.';
@@ -771,17 +808,18 @@ begin
   if v_next is null or p_new_status is distinct from v_next then
     raise exception 'This order is % and cannot be changed to %.', o.status, coalesce(p_new_status, 'that status');
   end if;
-  -- The first waiter who handles an order is credited with it.
-  select p.role into v_role from public.profiles p where p.id = auth.uid();
-  if v_role = 'waiter' and o.waiter_id is null then
-    select e.id, e.full_name into v_emp_id, v_emp_name
-    from public.restaurant_employees e
-    where e.user_id = auth.uid() and e.restaurant_id = v_rid and e.is_active;
+  -- The order always belongs to the waiter of its table, whoever clicks the button.
+  -- (Older or unassigned orders pick up the table's current waiter here.)
+  v_wid := o.waiter_id; v_wname := o.waiter_name;
+  if v_wid is null then
+    select t.waiter_id into v_wid from public.restaurant_tables t where t.id = o.table_id;
+    if v_wid is null then
+      raise exception 'Table % has no waiter yet. Assign a waiter to this table first.', o.table_label;
+    end if;
+    select e.full_name into v_wname from public.restaurant_employees e where e.id = v_wid;
   end if;
   update public.orders
-     set status = p_new_status,
-         waiter_id = coalesce(waiter_id, v_emp_id),
-         waiter_name = coalesce(waiter_name, v_emp_name),
+     set status = p_new_status, waiter_id = v_wid, waiter_name = v_wname,
          completed_at = case when p_new_status = 'completed' then now() else completed_at end
    where id = o.id;
   if p_new_status = 'completed' then
@@ -843,13 +881,17 @@ end $$;
 create or replace function public.update_request_status(p_request_id uuid, p_new_status text) returns void
 language plpgsql security definer set search_path = ''
 as $$
-declare v_rid uuid; r public.waiter_requests; v_ok boolean;
+declare v_rid uuid; r public.waiter_requests; v_ok boolean; v_role text;
 begin
   v_rid := public._staff_restaurant(array['owner', 'waiter']);
   perform public._require_open(v_rid);
   select * into r from public.waiter_requests where id = p_request_id and restaurant_id = v_rid for update;
   if not found then
     raise exception 'Request not found.';
+  end if;
+  select p.role into v_role from public.profiles p where p.id = auth.uid();
+  if v_role = 'waiter' and r.waiter_id is distinct from public.auth_employee_id() then
+    raise exception 'This request belongs to another waiter''s table.';
   end if;
   v_ok := case r.status
     when 'pending' then p_new_status in ('accepted', 'cancelled')
@@ -885,6 +927,106 @@ begin
      and created_at < now() - make_interval(mins => v_min);
   get diagnostics v_count = row_count;
   return v_count;
+end $$;
+
+-- Give a table to a waiter (or to nobody). Orders and requests that are still open move with
+-- the table, so the person serving the table is the person who handles and earns from them.
+-- Completed and cancelled orders never change. Internal: callers check permission first.
+create or replace function public._move_table(p_rid uuid, p_table_id uuid, p_waiter_id uuid) returns void
+language plpgsql security definer set search_path = ''
+as $$
+declare v_name text;
+begin
+  if p_waiter_id is not null then
+    select e.full_name into v_name from public.restaurant_employees e where e.id = p_waiter_id;
+  end if;
+  update public.restaurant_tables set waiter_id = p_waiter_id where id = p_table_id and restaurant_id = p_rid;
+  update public.orders set waiter_id = p_waiter_id, waiter_name = v_name
+   where table_id = p_table_id and restaurant_id = p_rid and status not in ('completed', 'cancelled');
+  update public.waiter_requests set waiter_id = p_waiter_id
+   where table_id = p_table_id and restaurant_id = p_rid and status in ('pending', 'accepted', 'in_progress');
+end $$;
+
+create or replace function public._require_active_waiter(p_rid uuid, p_waiter_id uuid) returns void
+language plpgsql stable security definer set search_path = ''
+as $$
+begin
+  if not exists (select 1 from public.restaurant_employees e
+                  where e.id = p_waiter_id and e.restaurant_id = p_rid and e.is_active) then
+    raise exception 'Please choose an active waiter of your restaurant.';
+  end if;
+end $$;
+
+create or replace function public.assign_table_waiter(p_table_id uuid, p_waiter_id uuid) returns void
+language plpgsql security definer set search_path = ''
+as $$
+declare v_rid uuid; t public.restaurant_tables;
+begin
+  v_rid := public._staff_restaurant(array['owner']);
+  perform public._require_open(v_rid);
+  select * into t from public.restaurant_tables where id = p_table_id and restaurant_id = v_rid for update;
+  if not found then
+    raise exception 'Table not found.';
+  end if;
+  if p_waiter_id is not null then
+    perform public._require_active_waiter(v_rid, p_waiter_id);
+  end if;
+  perform public._move_table(v_rid, t.id, p_waiter_id);
+  perform public.log_audit('table.assign_waiter', 'table', t.id, v_rid,
+    jsonb_build_object('table', t.label, 'from', t.waiter_id, 'to', p_waiter_id));
+end $$;
+
+-- Set the full list of tables a waiter looks after. Tables dropped from the list become
+-- unassigned; tables added to it are taken from whoever had them.
+create or replace function public.set_waiter_tables(p_waiter_id uuid, p_table_ids uuid[]) returns integer
+language plpgsql security definer set search_path = ''
+as $$
+declare v_rid uuid; v_ids uuid[]; v_id uuid; v_n integer;
+begin
+  v_rid := public._staff_restaurant(array['owner']);
+  perform public._require_open(v_rid);
+  perform public._require_active_waiter(v_rid, p_waiter_id);
+  v_ids := coalesce(p_table_ids, '{}');
+  select count(*) into v_n from public.restaurant_tables t where t.restaurant_id = v_rid and t.id = any (v_ids);
+  if v_n <> (select count(distinct x) from unnest(v_ids) x) then
+    raise exception 'One of the selected tables was not found.';
+  end if;
+  for v_id in select t.id from public.restaurant_tables t
+               where t.restaurant_id = v_rid and t.waiter_id = p_waiter_id and not (t.id = any (v_ids)) loop
+    perform public._move_table(v_rid, v_id, null);
+  end loop;
+  for v_id in select t.id from public.restaurant_tables t
+               where t.restaurant_id = v_rid and t.id = any (v_ids) and t.waiter_id is distinct from p_waiter_id loop
+    perform public._move_table(v_rid, v_id, p_waiter_id);
+  end loop;
+  perform public.log_audit('waiter.set_tables', 'employee', p_waiter_id, v_rid,
+    jsonb_build_object('table_count', coalesce(array_length(v_ids, 1), 0)));
+  return coalesce(array_length(v_ids, 1), 0);
+end $$;
+
+-- Waiter on leave: hand ALL of their tables to another waiter in one step.
+create or replace function public.reassign_waiter_tables(p_from_waiter uuid, p_to_waiter uuid) returns integer
+language plpgsql security definer set search_path = ''
+as $$
+declare v_rid uuid; v_id uuid; v_n integer := 0;
+begin
+  v_rid := public._staff_restaurant(array['owner']);
+  perform public._require_open(v_rid);
+  if p_from_waiter is null or p_to_waiter is null or p_from_waiter = p_to_waiter then
+    raise exception 'Please choose two different waiters.';
+  end if;
+  if not exists (select 1 from public.restaurant_employees e where e.id = p_from_waiter and e.restaurant_id = v_rid) then
+    raise exception 'Waiter not found.';
+  end if;
+  perform public._require_active_waiter(v_rid, p_to_waiter);
+  for v_id in select t.id from public.restaurant_tables t
+               where t.restaurant_id = v_rid and t.waiter_id = p_from_waiter loop
+    perform public._move_table(v_rid, v_id, p_to_waiter);
+    v_n := v_n + 1;
+  end loop;
+  perform public.log_audit('waiter.reassign_tables', 'employee', p_from_waiter, v_rid,
+    jsonb_build_object('to', p_to_waiter, 'tables', v_n));
+  return v_n;
 end $$;
 
 -- Replace a table's QR token. The old QR code stops working immediately.
@@ -1358,9 +1500,11 @@ begin
   begin
     update public.restaurants set next_order_number = next_order_number + 1
      where id = t.restaurant_id returning next_order_number - 1 into v_num;
-    insert into public.orders (restaurant_id, order_number, table_id, table_label, status, subtotal, discount, total,
-                               notes, idempotency_key)
-    values (t.restaurant_id, v_num, t.id, t.label, 'received', v_subtotal, 0, v_subtotal, v_notes, v_key)
+    insert into public.orders (restaurant_id, order_number, table_id, table_label, waiter_id, waiter_name, status,
+                               subtotal, discount, total, notes, idempotency_key)
+    values (t.restaurant_id, v_num, t.id, t.label, t.waiter_id,
+            (select e.full_name from public.restaurant_employees e where e.id = t.waiter_id),
+            'received', v_subtotal, 0, v_subtotal, v_notes, v_key)
     returning id into v_order_id;
   exception when unique_violation then
     -- Two identical submissions raced each other: return the winner.
@@ -1430,8 +1574,8 @@ begin
     raise exception 'This table has sent many requests very recently. A waiter is on the way.';
   end if;
   begin
-    insert into public.waiter_requests (restaurant_id, table_id, table_label, request_type, note)
-    values (t.restaurant_id, t.id, t.label, p_type, v_note) returning id into v_id;
+    insert into public.waiter_requests (restaurant_id, table_id, table_label, waiter_id, request_type, note)
+    values (t.restaurant_id, t.id, t.label, t.waiter_id, p_type, v_note) returning id into v_id;
   exception when unique_violation then
     select q.id, q.status into v_open from public.waiter_requests q
      where q.table_id = t.id and q.request_type = p_type and q.status in ('pending', 'accepted', 'in_progress');
@@ -1714,402 +1858,4 @@ begin
             'expiry_reminder', auth.uid());
     v_count := v_count + 1;
   end loop;
-  perform public.log_audit('subscription.reminders', 'subscription', null, null,
-    jsonb_build_object('within_days', p_within_days, 'sent', v_count));
-  return v_count;
-end $$;
-
--- Approve or reject a payment. ONLY the Super Admin can do this. Approving
--- renews the subscription for the plan's duration.
-create or replace function public.admin_review_payment(p_payment_id uuid, p_approve boolean, p_note text)
-returns void
-language plpgsql security definer set search_path = ''
-as $$
-declare pay public.subscription_payments; v_days integer; v_note text; v_new date;
-begin
-  perform public._require_super();
-  v_note := nullif(left(btrim(coalesce(p_note, '')), 500), '');
-  select * into pay from public.subscription_payments where id = p_payment_id for update;
-  if not found then
-    raise exception 'Payment not found.';
-  end if;
-  if pay.status <> 'pending' then
-    raise exception 'This payment was already reviewed.';
-  end if;
-  if p_approve then
-    select pl.duration_days into v_days from public.subscription_plans pl where pl.code = pay.plan_code;
-    v_new := public._apply_renewal(pay.restaurant_id, pay.plan_code, v_days, auth.uid());
-    update public.subscription_payments
-       set status = 'approved', review_note = v_note, reviewed_by = auth.uid(), reviewed_at = now()
-     where id = pay.id;
-    insert into public.restaurant_messages (restaurant_id, title, body, kind, created_by)
-    values (pay.restaurant_id, 'Payment approved',
-            format('Your payment of Rs. %s was approved. Your subscription now ends on %s.',
-                   trim(to_char(pay.amount, 'FM999,999,999,990.00')), to_char(v_new, 'DD Mon YYYY')),
-            'payment', auth.uid());
-  else
-    if v_note is null then
-      raise exception 'Please enter a rejection reason.';
-    end if;
-    update public.subscription_payments
-       set status = 'rejected', rejection_reason = v_note, reviewed_by = auth.uid(), reviewed_at = now()
-     where id = pay.id;
-    insert into public.restaurant_messages (restaurant_id, title, body, kind, created_by)
-    values (pay.restaurant_id, 'Payment rejected',
-            format('Your payment of Rs. %s was not approved. Reason: %s',
-                   trim(to_char(pay.amount, 'FM999,999,999,990.00')), v_note),
-            'payment', auth.uid());
-  end if;
-  perform public.log_audit(case when p_approve then 'payment.approve' else 'payment.reject' end,
-    'subscription_payment', pay.id, pay.restaurant_id,
-    jsonb_build_object('amount', pay.amount, 'plan', pay.plan_code));
-end $$;
-
-create or replace function public.admin_send_message(p_restaurant_id uuid, p_title text, p_body text) returns void
-language plpgsql security definer set search_path = ''
-as $$
-declare v_count integer;
-begin
-  perform public._require_super();
-  if char_length(btrim(coalesce(p_title, ''))) not between 1 and 120 then
-    raise exception 'The title is required (maximum 120 characters).';
-  end if;
-  if char_length(btrim(coalesce(p_body, ''))) not between 1 and 2000 then
-    raise exception 'The message is required (maximum 2000 characters).';
-  end if;
-  if p_restaurant_id is not null and not exists (select 1 from public.restaurants where id = p_restaurant_id) then
-    raise exception 'Restaurant not found.';
-  end if;
-  insert into public.restaurant_messages (restaurant_id, title, body, kind, created_by)
-  select r.id, btrim(p_title), btrim(p_body), 'admin', auth.uid()
-    from public.restaurants r where p_restaurant_id is null or r.id = p_restaurant_id;
-  get diagnostics v_count = row_count;
-  perform public.log_audit('message.send', 'restaurant_message', null, p_restaurant_id,
-    jsonb_build_object('title', btrim(p_title), 'recipients', v_count));
-end $$;
-
-create or replace function public.admin_save_setting(p_key text, p_value jsonb) returns void
-language plpgsql security definer set search_path = ''
-as $$
-declare k text; v jsonb;
-begin
-  perform public._require_super();
-  if p_key not in ('login_help_text', 'forgot_password_text', 'global_announcement', 'subscription_reminder_text',
-                   'expiry_reminder_days', 'ui_labels', 'ai_provider', 'ai_model', 'ai_enabled') then
-    raise exception 'Unknown setting.';
-  end if;
-  if p_value is null then
-    raise exception 'The value is missing.';
-  end if;
-  if p_key in ('login_help_text', 'forgot_password_text', 'global_announcement', 'subscription_reminder_text') then
-    if jsonb_typeof(p_value) <> 'string' or char_length(p_value #>> '{}') > 500 then
-      raise exception 'The text is too long (maximum 500 characters).';
-    end if;
-  elsif p_key = 'expiry_reminder_days' then
-    if jsonb_typeof(p_value) <> 'number' or (p_value #>> '{}') !~ '^[0-9]{1,2}$'
-       or (p_value #>> '{}')::integer not between 1 and 60 then
-      raise exception 'Reminder days must be a whole number from 1 to 60.';
-    end if;
-  elsif p_key = 'ai_enabled' then
-    if jsonb_typeof(p_value) <> 'boolean' then
-      raise exception 'The value must be on or off.';
-    end if;
-  elsif p_key = 'ai_provider' then
-    if jsonb_typeof(p_value) <> 'string' or (p_value #>> '{}') not in ('gemini') then
-      raise exception 'Unknown AI provider.';
-    end if;
-  elsif p_key = 'ai_model' then
-    if jsonb_typeof(p_value) <> 'string' or (p_value #>> '{}') !~ '^[A-Za-z0-9._-]{1,80}$' then
-      raise exception 'The model name may only contain letters, numbers, dots, dashes and underscores.';
-    end if;
-  elsif p_key = 'ui_labels' then
-    if jsonb_typeof(p_value) <> 'object' or (select count(*) from jsonb_object_keys(p_value)) > 100 then
-      raise exception 'The labels are not valid.';
-    end if;
-    for k, v in select * from jsonb_each(p_value) loop
-      if k !~ '^[a-z0-9_]{2,60}$' or jsonb_typeof(v) <> 'string' or char_length(v #>> '{}') > 60 then
-        raise exception 'The labels are not valid.';
-      end if;
-    end loop;
-  end if;
-  insert into public.system_settings (key, value, updated_by) values (p_key, p_value, auth.uid())
-  on conflict (key) do update set value = excluded.value, updated_at = now(), updated_by = excluded.updated_by;
-  perform public.log_audit('setting.update', 'system_setting', null, null, jsonb_build_object('key', p_key));
-end $$;
-
--- -----------------------------------------------------------------------------
--- 8. SERVICE FUNCTIONS - callable ONLY with the service-role key, i.e. only from
---    the `admin-users` Edge Function after it has created the Auth user.
---    Each one re-checks the acting user, so a bug in the Edge Function cannot
---    turn into a privilege escalation.
--- -----------------------------------------------------------------------------
-
-create or replace function public.service_find_user_by_email(p_email text) returns uuid
-language sql stable security definer set search_path = ''
-as $$ select u.id from auth.users u where lower(u.email) = lower(btrim(p_email)) limit 1 $$;
-
-create or replace function public.service_create_restaurant(
-  p_actor uuid, p_name text, p_phone text, p_city text,
-  p_owner_id uuid, p_owner_email text, p_owner_name text, p_plan_code text
-) returns jsonb
-language plpgsql security definer set search_path = ''
-as $$
-declare v_rid uuid; v_plan public.subscription_plans; v_today date := public.pkt_today();
-begin
-  if not exists (select 1 from public.profiles p where p.id = p_actor and p.role = 'super_admin' and p.is_active) then
-    raise exception 'permission denied' using errcode = '42501';
-  end if;
-  if char_length(btrim(coalesce(p_name, ''))) not between 1 and 100 then
-    raise exception 'Restaurant name is required (maximum 100 characters).';
-  end if;
-  select * into v_plan from public.subscription_plans where code = p_plan_code and is_active;
-  if not found then
-    raise exception 'That plan does not exist or is not active.';
-  end if;
-  insert into public.restaurants (name, phone, city)
-  values (btrim(p_name), nullif(left(btrim(coalesce(p_phone, '')), 30), ''), nullif(left(btrim(coalesce(p_city, '')), 60), ''))
-  returning id into v_rid;
-  insert into public.profiles (id, email, full_name, role, restaurant_id)
-  values (p_owner_id, lower(btrim(p_owner_email)), nullif(btrim(coalesce(p_owner_name, '')), ''), 'owner', v_rid);
-  update public.restaurants set owner_id = p_owner_id where id = v_rid;
-  insert into public.subscriptions (restaurant_id, plan_code, status, start_date, expiry_date)
-  values (v_rid, v_plan.code, case when v_plan.code = 'free_trial' then 'trial' else 'active' end,
-          v_today, v_today + v_plan.duration_days);
-  insert into public.restaurant_messages (restaurant_id, title, body, kind, created_by)
-  values (v_rid, 'Welcome to Smart Restaurant',
-          'Your restaurant account is ready. Start by adding menu categories and products, then add your tables and print the QR codes.',
-          'admin', p_actor);
-  perform public.log_audit('restaurant.create', 'restaurant', v_rid, v_rid,
-    jsonb_build_object('name', btrim(p_name), 'owner_email', lower(btrim(p_owner_email)), 'plan', v_plan.code), p_actor);
-  return jsonb_build_object('restaurant_id', v_rid);
-end $$;
-
-create or replace function public.service_assign_owner(
-  p_actor uuid, p_restaurant_id uuid, p_user_id uuid, p_email text, p_name text
-) returns jsonb
-language plpgsql security definer set search_path = ''
-as $$
-declare v_prof public.profiles; v_old uuid;
-begin
-  if not exists (select 1 from public.profiles p where p.id = p_actor and p.role = 'super_admin' and p.is_active) then
-    raise exception 'permission denied' using errcode = '42501';
-  end if;
-  if not exists (select 1 from public.restaurants where id = p_restaurant_id) then
-    raise exception 'Restaurant not found.';
-  end if;
-  select * into v_prof from public.profiles where id = p_user_id;
-  if found and (v_prof.role <> 'owner' or v_prof.restaurant_id is distinct from p_restaurant_id) then
-    raise exception 'That email already belongs to another account (a different role or restaurant). Please use a different email.';
-  end if;
-  select owner_id into v_old from public.restaurants where id = p_restaurant_id;
-  if v_old is not null and v_old <> p_user_id then
-    update public.profiles set is_active = false where id = v_old;   -- replaced owner loses access
-  end if;
-  insert into public.profiles (id, email, full_name, role, restaurant_id)
-  values (p_user_id, lower(btrim(p_email)), nullif(btrim(coalesce(p_name, '')), ''), 'owner', p_restaurant_id)
-  on conflict (id) do update
-    set is_active = true, full_name = coalesce(nullif(btrim(coalesce(p_name, '')), ''), public.profiles.full_name);
-  update public.restaurants set owner_id = p_user_id where id = p_restaurant_id;
-  perform public.log_audit('restaurant.assign_owner', 'restaurant', p_restaurant_id, p_restaurant_id,
-    jsonb_build_object('owner_email', lower(btrim(p_email))), p_actor);
-  return jsonb_build_object('restaurant_id', p_restaurant_id, 'owner_id', p_user_id);
-end $$;
-
-create or replace function public.service_create_employee(
-  p_actor uuid, p_user_id uuid, p_email text, p_name text, p_phone text, p_pct numeric
-) returns jsonb
-language plpgsql security definer set search_path = ''
-as $$
-declare v_rid uuid; v_emp uuid;
-begin
-  select p.restaurant_id into v_rid from public.profiles p
-   where p.id = p_actor and p.role = 'owner' and p.is_active;
-  if v_rid is null then
-    raise exception 'permission denied' using errcode = '42501';
-  end if;
-  perform public._require_open(v_rid);
-  if char_length(btrim(coalesce(p_name, ''))) not between 1 and 100 then
-    raise exception 'The waiter name is required (maximum 100 characters).';
-  end if;
-  if p_pct is null or p_pct < 0 or p_pct > 100 then
-    raise exception 'Commission must be between 0 and 100.';
-  end if;
-  insert into public.profiles (id, email, full_name, role, restaurant_id)
-  values (p_user_id, lower(btrim(p_email)), btrim(p_name), 'waiter', v_rid);
-  insert into public.restaurant_employees (restaurant_id, user_id, full_name, email, phone, commission_pct)
-  values (v_rid, p_user_id, btrim(p_name), lower(btrim(p_email)),
-          nullif(left(btrim(coalesce(p_phone, '')), 30), ''), p_pct)
-  returning id into v_emp;
-  perform public.log_audit('employee.create', 'restaurant_employee', v_emp, v_rid,
-    jsonb_build_object('email', lower(btrim(p_email))), p_actor);
-  return jsonb_build_object('employee_id', v_emp, 'restaurant_id', v_rid);
-end $$;
-
--- One-time helper for the FIRST Super Admin (see README). Run it from the SQL
--- Editor only. It refuses to run if a Super Admin already exists.
-create or replace function public.bootstrap_super_admin(p_email text) returns text
-language plpgsql security definer set search_path = ''
-as $$
-declare v_uid uuid;
-begin
-  if exists (select 1 from public.profiles where role = 'super_admin') then
-    raise exception 'A Super Admin already exists. This helper only works once.';
-  end if;
-  select u.id into v_uid from auth.users u where lower(u.email) = lower(btrim(p_email));
-  if v_uid is null then
-    raise exception 'No Auth user with that email. Create it first in Supabase: Authentication -> Users -> Add user.';
-  end if;
-  insert into public.profiles (id, email, full_name, role)
-  values (v_uid, lower(btrim(p_email)), 'Super Admin', 'super_admin');
-  perform public.log_audit('super_admin.bootstrap', 'profile', v_uid, null, '{}'::jsonb, v_uid);
-  return 'Super Admin created for ' || lower(btrim(p_email));
-end $$;
-
--- -----------------------------------------------------------------------------
--- 9. STORAGE BUCKETS AND POLICIES
---    restaurant-assets : PUBLIC (logos, food photos) - only the owner can upload,
---                        and only into the folder named after their restaurant id.
---    payment-proofs    : PRIVATE - owner uploads into their own folder; only the
---                        owner of that folder and the Super Admin can open files.
--- -----------------------------------------------------------------------------
-
-insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types) values
-  ('restaurant-assets', 'restaurant-assets', true, 3145728, array['image/png', 'image/jpeg', 'image/webp']),
-  ('payment-proofs', 'payment-proofs', false, 5242880, array['image/png', 'image/jpeg', 'application/pdf'])
-on conflict (id) do update
-  set public = excluded.public, file_size_limit = excluded.file_size_limit,
-      allowed_mime_types = excluded.allowed_mime_types;
-
-drop policy if exists "assets_owner_insert" on storage.objects;
-create policy "assets_owner_insert" on storage.objects for insert to authenticated
-  with check (bucket_id = 'restaurant-assets'
-              and (storage.foldername(name))[1] = (select public.auth_restaurant_id())::text
-              and (select public.auth_role()) = 'owner');
-
-drop policy if exists "assets_owner_delete" on storage.objects;
-create policy "assets_owner_delete" on storage.objects for delete to authenticated
-  using (bucket_id = 'restaurant-assets'
-         and (storage.foldername(name))[1] = (select public.auth_restaurant_id())::text
-         and (select public.auth_role()) = 'owner');
-
-drop policy if exists "proofs_owner_insert" on storage.objects;
-create policy "proofs_owner_insert" on storage.objects for insert to authenticated
-  with check (bucket_id = 'payment-proofs'
-              and (storage.foldername(name))[1] = (select public.auth_restaurant_id())::text
-              and (select public.auth_role()) = 'owner');
-
-drop policy if exists "proofs_select" on storage.objects;
-create policy "proofs_select" on storage.objects for select to authenticated
-  using (bucket_id = 'payment-proofs'
-         and ((select public.is_super_admin())
-              or ((storage.foldername(name))[1] = (select public.auth_restaurant_id())::text
-                  and (select public.auth_role()) = 'owner')));
-
--- -----------------------------------------------------------------------------
--- 10. GRANTS  (least privilege)
---     Start from nothing, then give back only what the app needs.
--- -----------------------------------------------------------------------------
-
-revoke all on all tables in schema public from anon, authenticated;
-revoke all on all functions in schema public from public, anon, authenticated;
-
-grant usage on schema public to anon, authenticated;
-
--- Read access (rows are still filtered by the RLS policies above).
-grant select on public.profiles, public.restaurants, public.restaurant_employees,
-  public.subscription_plans, public.subscriptions, public.subscription_payments,
-  public.restaurant_messages, public.menu_categories, public.menu_items, public.restaurant_tables,
-  public.orders, public.order_items, public.waiter_requests, public.inventory,
-  public.inventory_transactions, public.expenses, public.sales_records, public.system_settings,
-  public.audit_logs
-  to authenticated;
-
--- Direct writes, column by column. Anything not listed here (status, role,
--- subscription, totals, tokens, quantities ...) can only change via functions.
-grant update (name, phone, email, address, city, logo_url, commission_basis, escalation_minutes,
-              waiter_can_view_sales, waiter_can_view_commission)
-  on public.restaurants to authenticated;
-grant update (full_name, phone, commission_pct, is_active) on public.restaurant_employees to authenticated;
-grant insert (restaurant_id, name, sort_order, is_active), update (name, sort_order, is_active)
-  on public.menu_categories to authenticated;
-grant insert (restaurant_id, category_id, name, description, price, cost_price, image_url,
-              is_available, is_active, is_featured, is_popular),
-      update (category_id, name, description, price, cost_price, image_url,
-              is_available, is_active, is_featured, is_popular)
-  on public.menu_items to authenticated;
-grant insert (restaurant_id, label, seats), update (label, seats, is_active)
-  on public.restaurant_tables to authenticated;
-grant insert (restaurant_id, name, unit, quantity, reorder_threshold, cost_per_unit),
-      update (name, unit, reorder_threshold, cost_per_unit)
-  on public.inventory to authenticated;
-grant insert (restaurant_id, expense_date, category, description, amount), delete
-  on public.expenses to authenticated;
-
--- Functions used inside policies.
-grant execute on function public.auth_role(), public.auth_restaurant_id(), public.is_super_admin(),
-  public.is_owner_of(uuid), public.is_member_of(uuid), public.restaurant_is_open(uuid) to authenticated;
-
--- Functions the signed-in dashboard calls.
-grant execute on function
-  public.get_my_context(), public.get_access_gate(), public.mark_message_read(uuid),
-  public.update_order_status(uuid, text), public.cancel_order(uuid, text), public.refund_order(uuid, text),
-  public.update_request_status(uuid, text), public.escalate_stale_requests(),
-  public.regenerate_table_token(uuid), public.adjust_stock(uuid, text, numeric, text),
-  public.submit_payment_proof(text, numeric, text, text, text),
-  public.dashboard_summary(), public.analytics(date, date), public.waiter_stats(date, date),
-  public.commission_report(date, date, uuid), public.commission_history(date, date, uuid),
-  public.admin_overview(date, date), public.admin_list_restaurants(text),
-  public.admin_update_restaurant(uuid, text, text, text), public.admin_set_restaurant_status(uuid, text),
-  public.admin_save_plan(text, text, numeric, integer, boolean, text),
-  public.admin_set_subscription(uuid, text, text, date, date),
-  public.admin_renew_subscription(uuid, text, integer), public.admin_extend_subscription(uuid, integer),
-  public.admin_send_expiry_reminders(integer), public.admin_review_payment(uuid, boolean, text),
-  public.admin_send_message(uuid, text, text), public.admin_save_setting(text, jsonb)
-  to authenticated;
-
--- Functions the public (QR customers and the login page) may call.
-grant execute on function
-  public.get_public_settings(), public.get_labels(),
-  public.customer_get_menu(text), public.customer_place_order(text, jsonb, text, text),
-  public.customer_get_orders(text, uuid[]), public.customer_create_request(text, text, text),
-  public.customer_get_requests(text)
-  to anon, authenticated;
-
--- Service-role only (Edge Function). Nobody else, including signed-in users.
-grant execute on function
-  public.service_find_user_by_email(text),
-  public.service_create_restaurant(uuid, text, text, text, uuid, text, text, text),
-  public.service_assign_owner(uuid, uuid, uuid, text, text),
-  public.service_create_employee(uuid, uuid, text, text, text, numeric)
-  to service_role;
-
--- -----------------------------------------------------------------------------
--- 11. SEED DATA (safe to re-run; never overwrites your changes)
---     Prices are 0 on purpose: set your real prices in Super Admin -> Plans.
---     The Free Trial length (14 days) is only a starting value you can change.
--- -----------------------------------------------------------------------------
-
-insert into public.subscription_plans (code, name, price_pkr, duration_days, description, sort_order) values
-  ('free_trial',   'Free Trial',   0, 14, 'Try Smart Restaurant before you subscribe.', 1),
-  ('basic',        'Basic',        0, 30, '', 2),
-  ('professional', 'Professional', 0, 30, '', 3),
-  ('premium',      'Premium',      0, 30, '', 4)
-on conflict (code) do nothing;
-
-insert into public.system_settings (key, value) values
-  ('login_help_text', to_jsonb(''::text)),
-  ('forgot_password_text', to_jsonb(''::text)),
-  ('global_announcement', to_jsonb(''::text)),
-  ('subscription_reminder_text', to_jsonb(''::text)),
-  ('expiry_reminder_days', to_jsonb(7)),
-  ('ui_labels', '{}'::jsonb),
-  ('ai_provider', to_jsonb('gemini'::text)),
-  ('ai_model', to_jsonb('gemini-2.5-flash'::text)),
-  ('ai_enabled', to_jsonb(false))
-on conflict (key) do nothing;
-
--- =============================================================================
--- END OF database.sql
--- Next: create the first Super Admin (README step), then deploy the Edge
--- Functions and the customer page (Part 4).
--- =============================================================================
+  perform public.log_audit('subscriptio
