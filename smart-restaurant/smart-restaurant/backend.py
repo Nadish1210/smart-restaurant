@@ -27,7 +27,8 @@ DATABASE CONTRACT (implemented by database.sql - Part 3)
   RPCs   : get_my_context, get_public_settings, get_labels, get_access_gate,
            update_order_status, cancel_order, refund_order,
            update_request_status, escalate_stale_requests,
-           regenerate_table_token, adjust_stock, mark_message_read,
+           regenerate_table_token, assign_table_waiter, set_waiter_tables,
+           reassign_waiter_tables, adjust_stock, mark_message_read,
            submit_payment_proof, dashboard_summary, analytics,
            commission_report, commission_history, waiter_stats,
            admin_overview, admin_list_restaurants, admin_update_restaurant,
@@ -1054,6 +1055,29 @@ class SmartRestaurantAPI:
     def regenerate_table_token(self, table_id) -> None:
         self._need("owner")
         self._call("regenerate_table_token", {"p_table_id": clean_uuid(table_id, "Table")})
+
+    # --- which waiter looks after which table ---------------------------
+    def assign_table_waiter(self, table_id, waiter_id) -> None:
+        """Give one table to a waiter (waiter_id=None leaves it without a waiter)."""
+        self._need("owner")
+        self._call("assign_table_waiter", {
+            "p_table_id": clean_uuid(table_id, "Table"),
+            "p_waiter_id": clean_uuid(waiter_id, "Waiter") if waiter_id else None,
+        })
+
+    def set_waiter_tables(self, waiter_id, table_ids) -> int:
+        """Set the complete list of tables one waiter looks after."""
+        self._need("owner")
+        ids = [clean_uuid(t, "Table") for t in (table_ids or [])]
+        return int(self._call("set_waiter_tables", {
+            "p_waiter_id": clean_uuid(waiter_id, "Waiter"), "p_table_ids": ids}) or 0)
+
+    def reassign_waiter_tables(self, from_waiter_id, to_waiter_id) -> int:
+        """Waiter on leave: move ALL of their tables (and open orders) to another waiter."""
+        self._need("owner")
+        return int(self._call("reassign_waiter_tables", {
+            "p_from_waiter": clean_uuid(from_waiter_id, "Waiter"),
+            "p_to_waiter": clean_uuid(to_waiter_id, "Waiter")}) or 0)
 
     def customer_base_url(self) -> str:
         url = _secret("CUSTOMER_APP_URL").rstrip("/")
