@@ -74,7 +74,7 @@ class SmartRestaurantAPI():
       kind, quantity, reason) ; list_stock_movements(item_id, limit)
   list_expenses(date_from, date_to) ; add_expense(expense_date, category,
       description, amount) ; delete_expense(expense_id)
-  analytics(date_from, date_to) ; waiter_stats(date_from, date_to)
+  analytics(date_from, date_to) ; waiter_stats(date_from, date_to) ; waiter_analytics(date_from, date_to)
   get_my_subscription() ; list_plans() ; list_my_payments()
   submit_payment_proof(plan_code, amount, reference, note, data, filename,
       content_type)
@@ -595,19 +595,21 @@ def page_admin_overview(api) -> None:
         ("Expired subscriptions", str(ov["expired_subscriptions"])),
         ("Suspended", str(ov["suspended_restaurants"])),
         ("Pending payments", str(ov["pending_payments"])),
-        ("Orders (period)", str(ov["total_orders"])),
-        ("Sales (period)", _money(ov["total_sales"])),
+        ("Approved payments (period)", str(ov["payments_approved"])),
+        ("Income received (period)", _money(ov["revenue"])),
     ])
-    st.subheader("Daily platform sales")
-    daily = ov.get("daily_sales") or []
+    st.caption("This is the platform's own income from restaurant subscriptions. "
+               "Restaurant sales are private to each restaurant and are never shown here.")
+    st.subheader("Daily subscription income")
+    daily = ov.get("daily_revenue") or []
     if daily:
         df = pd.DataFrame(daily)
-        st.bar_chart(df.set_index("date")["sales"])
+        st.bar_chart(df.set_index("date")["revenue"])
     else:
-        st.info("No sales in this period.")
-    st.subheader("Top restaurants")
-    show_table(ov.get("top_restaurants"), {"restaurant": "Restaurant", "orders": "Orders",
-                                           "sales": "Sales"}, money=("sales",))
+        st.info("No approved payments in this period.")
+    st.subheader("Income by plan")
+    show_table(ov.get("revenue_by_plan"), {"plan": "Plan", "payments": "Payments",
+                                           "revenue": "Income"}, money=("revenue",))
 
 
 def page_admin_restaurants(api) -> None:
@@ -1809,9 +1811,12 @@ def page_messages(api) -> None:
 # WAITER pages
 # ---------------------------------------------------------------------------
 def page_my_stats(api) -> None:
-    _title("my_stats")
+    _title("my_stats", "Your own numbers, for the tables you look after.")
     start, end = date_filter("mystats", "Today")
     ok, s = attempt(api.waiter_stats, start, end)
+    if not ok:
+        return
+    ok, a = attempt(api.waiter_analytics, start, end)
     if not ok:
         return
     items = [("Orders handled", str(s["orders"])), ("Completed", str(s["completed"])),
@@ -1821,8 +1826,60 @@ def page_my_stats(api) -> None:
     if s.get("commission_visible"):
         items.append(("My commission", _money(s["commission"])))
     kpi_row(items)
-    if not s.get("sales_visible"):
-        st.caption("Sales and commission figures are shown only if your restaurant owner enables them.")
+    if not (s.get("sales_visible") and s.get("commission_visible")):
+        st.caption("Some money figures are hidden because your restaurant owner has not enabled them.")
+
+    more = [("Refunded orders", str(a.get("refunded_orders", 0)))]
+    if a.get("avg_order_value") is not None:
+        more.insert(0, ("Average order", _money(a["avg_order_value"])))
+    if a.get("commission_pct") is not None:
+        more.append(("My commission rate", f"{float(a['commission_pct']):g}%"))
+    if a.get("commission_reversed") is not None:
+        more.append(("Commission reversed (refunds)", _money(a["commission_reversed"])))
+    if a.get("avg_minutes_to_complete") is not None:
+        more.append(("Avg time to complete an order", f"{float(a['avg_minutes_to_complete']):g} min"))
+    if a.get("avg_minutes_to_accept_request") is not None:
+        more.append(("Avg time to accept a request", f"{float(a['avg_minutes_to_accept_request']):g} min"))
+    kpi_row(more)
+
+    daily = a.get("daily") or []
+    if daily and any(d["orders"] for d in daily):
+        df = pd.DataFrame(daily).set_index("date")
+        st.subheader("Completed orders per day")
+        st.bar_chart(df["orders"])
+        if a.get("sales_visible"):
+            st.subheader("My sales per day")
+            st.bar_chart(df["sales"])
+        if a.get("commission_visible"):
+            st.subheader("My commission per day")
+            st.bar_chart(df["commission"])
+        best = max(daily, key=lambda d: d["orders"])
+        st.caption(f"Busiest day: **{best['date']}** with {best['orders']} completed order(s).")
+    else:
+        st.info("No completed orders in this period yet.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Best-selling dishes at my tables")
+        cols = {"name": "Dish", "quantity": "Sold"}
+        if a.get("sales_visible"):
+            cols["sales"] = "Sales"
+        show_table(a.get("top_items"), cols, money=("sales",) if a.get("sales_visible") else (),
+                   empty="No dishes sold yet.")
+    with c2:
+        st.subheader("My busiest tables")
+        cols = {"table": "Table", "orders": "Orders"}
+        if a.get("sales_visible"):
+            cols["sales"] = "Sales"
+        show_table(a.get("by_table"), cols, money=("sales",) if a.get("sales_visible") else (),
+                   empty="No completed orders yet.")
+
+    hours = a.get("by_hour") or []
+    if hours:
+        st.subheader("When my orders arrive (hour of day)")
+        full = {h["hour"]: h["orders"] for h in hours}
+        st.bar_chart(pd.DataFrame({"orders": [full.get(h, 0) for h in range(24)]},
+                                  index=[f"{h:02d}:00" for h in range(24)]))
 
 
 # ---------------------------------------------------------------------------
