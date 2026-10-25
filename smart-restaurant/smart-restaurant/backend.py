@@ -30,7 +30,7 @@ DATABASE CONTRACT (implemented by database.sql - Part 3)
            regenerate_table_token, assign_table_waiter, set_waiter_tables,
            reassign_waiter_tables, adjust_stock, mark_message_read,
            submit_payment_proof, dashboard_summary, analytics,
-           commission_report, commission_history, waiter_stats,
+           commission_report, commission_history, waiter_stats, waiter_analytics,
            admin_overview, admin_list_restaurants, admin_update_restaurant,
            admin_set_restaurant_status, admin_save_plan,
            admin_set_subscription, admin_renew_subscription,
@@ -705,7 +705,7 @@ class SmartRestaurantAPI:
         return _with_defaults(data, {
             "total_restaurants": 0, "active_restaurants": 0, "trial_accounts": 0,
             "expired_subscriptions": 0, "suspended_restaurants": 0, "pending_payments": 0,
-            "total_orders": 0, "total_sales": 0, "daily_sales": [], "top_restaurants": [],
+            "payments_approved": 0, "revenue": 0, "daily_revenue": [], "revenue_by_plan": [],
         })
 
     def admin_list_restaurants(self, search: str | None = None) -> list[dict]:
@@ -1309,6 +1309,17 @@ class SmartRestaurantAPI:
             "p_from": as_iso_date(date_from), "p_to": as_iso_date(date_to)}), {
             "orders": 0, "completed": 0, "cancelled": 0, "requests_handled": 0, "sales": 0,
             "commission": 0, "sales_visible": False, "commission_visible": False,
+        })
+
+    def waiter_analytics(self, date_from, date_to) -> dict:
+        """A waiter's own performance (daily trend, top dishes, tables, busy hours, speed)."""
+        self._need("waiter")
+        return _with_defaults(self._call("waiter_analytics", {
+            "p_from": as_iso_date(date_from), "p_to": as_iso_date(date_to)}), {
+            "sales_visible": False, "commission_visible": False, "commission_pct": None,
+            "avg_order_value": None, "refunded_orders": 0, "commission_reversed": None,
+            "avg_minutes_to_complete": None, "avg_minutes_to_accept_request": None,
+            "daily": [], "top_items": [], "by_table": [], "by_hour": [],
         })
 
     # =======================================================================
