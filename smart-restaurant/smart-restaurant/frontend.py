@@ -992,6 +992,10 @@ def _order_card(api, o: dict, prefix: str, allow_cancel: bool) -> None:
         h2.markdown(f"{ORDER_BADGE.get(status, status)} · **{_money(o['total'])}**")
         st.caption(f"Placed {fmt_dt(o['created_at'])}"
                    + (f" · Waiter: {o['waiter_name']}" if o.get("waiter_name") else ""))
+        if not o.get("waiter_id") and status in backend.ORDER_TRANSITIONS and backend.ORDER_TRANSITIONS.get(status):
+            st.warning(f"Table {o.get('table_label') or '?'} has no waiter yet. "
+                       "Assign one in Tables so this order can be handled.")
+            return
         for it in o.get("items", []):
             line = f"{it['quantity']} × {it['name']}"
             if it.get("note"):
@@ -1026,7 +1030,12 @@ def _live_orders(api, key: str, statuses: list[str], group: bool, allow_cancel: 
     auto = c1.toggle("Auto-refresh (10s)", value=True, key=f"{key}_auto")
     sound = c2.toggle("🔔 Sound alert", value=False, key=f"{key}_sound",
                       help="Your browser may need one tap on the page before it allows sound.")
-    mine = c3.toggle("Only my orders", value=False, key=f"{key}_mine") if api.ctx["role"] == "waiter" else False
+    mine = False  # waiters only receive the orders of their own tables (enforced by the database)
+    if api.ctx["role"] == "waiter":
+        ok_t, tables = attempt(api.list_tables)
+        mine_tables = sorted((t["label"] for t in (tables or []) if t.get("waiter_id") == api.ctx.get("employee_id")),
+                             key=lambda x: (len(x), x)) if ok_t else []
+        c3.caption("Your tables: " + (", ".join(mine_tables) if mine_tables else "none yet. Ask the owner."))
     if sound and st.button("Test sound", key=f"{key}_testsound"):
         play_alert()
 
@@ -1067,7 +1076,7 @@ def page_orders(api) -> None:
         statuses = c1.multiselect("Status", backend.ORDER_STATUSES, default=backend.ORDER_STATUSES,
                                   format_func=lambda s: ORDER_BADGE.get(s, s), key="ord_hist_status")
         search = c2.text_input("Search order # or table", key="ord_hist_search")
-        mine = st.toggle("Only my orders", key="ord_hist_mine") if not is_owner else False
+        mine = False  # a waiter's history already contains only their own tables
         ok, orders = attempt(api.list_orders, statuses or backend.ORDER_STATUSES, start, end,
                              search or None, mine, 500)
         if not ok:
@@ -1395,8 +1404,29 @@ def page_tables(api) -> None:
     ok, tables = attempt(api.list_tables)
     if not ok:
         return
+    ok_w, emps = attempt(api.list_employees)
+    waiters = [e for e in (emps or []) if e.get("is_active", True)] if ok_w else []
+    wname = {e["id"]: e["full_name"] for e in (emps or [])}
     if not tables:
         st.info("No tables yet. Add your first table above.")
+    else:
+        unassigned = [t["label"] for t in tables if t.get("is_active", True) and not t.get("waiter_id")]
+        if unassigned:
+            st.warning("Tables without a waiter: **" + ", ".join(unassigned) + "**. Orders from these tables "
+                       "cannot be handled until you assign a waiter.")
+    if len(waiters) >= 2 and tables:
+        with st.expander("Waiter on leave? Move all their tables to another waiter"):
+            ids = [w["id"] for w in waiters]
+            src = st.selectbox("From waiter", ids, format_func=lambda i: wname.get(i, "?"), key="mv_from")
+            dst_opts = [i for i in ids if i != src]
+            dst = st.selectbox("To waiter", dst_opts, format_func=lambda i: wname.get(i, "?"), key="mv_to")
+            st.caption("Open orders and requests of those tables move too. Completed orders keep their "
+                       "original waiter and commission.")
+            if st.button("Move all tables", key="mv_go"):
+                ok, n = attempt(api.reassign_waiter_tables, src, dst)
+                if ok:
+                    flash(f"{n} table(s) moved.")
+                    st.rerun()
     for tb in tables:
         with st.container(border=True):
             c1, c2 = st.columns([1, 2])
@@ -1410,6 +1440,19 @@ def page_tables(api) -> None:
             with c2:
                 st.markdown(f"### Table {tb['label']} {'' if tb.get('is_active', True) else '(inactive)'}")
                 st.caption(f"{tb.get('seats', '')} seats")
+                opts = [None] + [w["id"] for w in waiters]
+                cur = tb.get("waiter_id") if tb.get("waiter_id") in opts else None
+                if tb.get("waiter_id") and cur is None:
+                    st.caption(f"Current waiter ({wname.get(tb['waiter_id'], '?')}) is inactive.")
+                w1, w2 = st.columns([3, 1])
+                pick = w1.selectbox("Waiter for this table", opts, index=opts.index(cur),
+                                    format_func=lambda i: "— no waiter —" if i is None else wname.get(i, "?"),
+                                    key=f"tw_{tb['id']}")
+                if w2.button("Save", key=f"tws_{tb['id']}", disabled=(pick == tb.get("waiter_id"))):
+                    ok, _ = attempt(api.assign_table_waiter, tb["id"], pick)
+                    if ok:
+                        flash(f"Table {tb['label']} updated.")
+                        st.rerun()
                 if url:
                     st.code(url, language=None)
                 a, b = st.columns(2)
@@ -1462,6 +1505,7 @@ def page_staff(api) -> None:
             return
         if not emps:
             st.info("No waiters yet.")
+        wname_of = {x["id"]: x["full_name"] for x in emps}
         for e in emps:
             tag = "" if e.get("is_active", True) else " (inactive)"
             with st.expander(f"{e['full_name']}{tag} — {e.get('commission_pct', 0)}% commission"):
@@ -1481,6 +1525,21 @@ def page_staff(api) -> None:
                             if ok:
                                 flash("Waiter updated.")
                                 st.rerun()
+                if e.get("is_active", True):
+                    ok_t, all_tables = attempt(api.list_tables)
+                    act = [t for t in (all_tables or []) if t.get("is_active", True)] if ok_t else []
+                    tname = {t["id"]: t["label"] for t in act}
+                    taken = {t["id"]: t.get("waiter_id") for t in act}
+                    mine_ids = [t["id"] for t in act if t.get("waiter_id") == e["id"]]
+                    chosen = st.multiselect("Tables this waiter looks after", list(tname), default=mine_ids,
+                                            format_func=lambda i: f"Table {tname[i]}"
+                                            + (f" (now {wname_of.get(taken[i])})" if taken[i] and taken[i] != e["id"] else ""),
+                                            key=f"wt_{e['id']}") if tname else []
+                    if tname and st.button("Save tables", key=f"wts_{e['id']}", disabled=(set(chosen) == set(mine_ids))):
+                        ok, n = attempt(api.set_waiter_tables, e["id"], chosen)
+                        if ok:
+                            flash(f"{e['full_name']} now looks after {n} table(s).")
+                            st.rerun()
                 if e.get("email") and st.button("Send password reset email", key=f"pwr_{e['id']}"):
                     ok, _ = attempt(api.send_password_reset, e["email"])
                     if ok:
