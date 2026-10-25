@@ -43,8 +43,8 @@ create table if not exists public.restaurants (
   owner_id                    uuid,                       -- FK added after profiles exists
   commission_basis            text not null default 'gross' check (commission_basis in ('gross', 'net')),
   escalation_minutes          integer not null default 5 check (escalation_minutes between 1 and 120),
-  waiter_can_view_sales       boolean not null default false,
-  waiter_can_view_commission  boolean not null default false,
+  waiter_can_view_sales       boolean not null default true,
+  waiter_can_view_commission  boolean not null default true,
   next_order_number           bigint not null default 1,  -- per-restaurant order counter
   created_at                  timestamptz not null default now(),
   updated_at                  timestamptz not null default now()
@@ -269,6 +269,10 @@ create index if not exists requests_restaurant_idx on public.waiter_requests (re
 -- Prevent duplicate alerts: one open request of each type per table.
 create unique index if not exists requests_one_open_per_type on public.waiter_requests (table_id, request_type)
   where status in ('pending', 'accepted', 'in_progress') and table_id is not null;
+
+-- Waiters see their own sales and commission by default (the owner can switch this off per restaurant).
+alter table public.restaurants alter column waiter_can_view_sales set default true;
+alter table public.restaurants alter column waiter_can_view_commission set default true;
 
 -- Each table belongs to at most one waiter; a waiter may have many tables. Orders and
 -- requests from a table are credited to / handled by that table's waiter.
@@ -1294,6 +1298,97 @@ begin
     'sales_visible', v_see_sales, 'commission_visible', v_see_comm);
 end $$;
 
+-- A waiter's own performance: daily trend, best-selling dishes, busiest tables and hours, speed.
+-- Only the waiter's own tables are counted. Money fields are null unless the owner allows them.
+create or replace function public.waiter_analytics(p_from date, p_to date) returns jsonb
+language plpgsql stable security definer set search_path = ''
+as $$
+declare
+  v_rid uuid; v_emp uuid; v_lo timestamptz; v_hi timestamptz; r public.restaurants;
+  v_sales boolean; v_comm boolean; v_pct numeric;
+begin
+  v_rid := public._staff_restaurant(array['waiter']);
+  v_emp := public.auth_employee_id();
+  if v_emp is null then
+    raise exception 'permission denied' using errcode = '42501';
+  end if;
+  if p_from is null or p_to is null or p_from > p_to or p_to - p_from > 366 then
+    raise exception 'Please choose a valid date range.';
+  end if;
+  v_lo := public.pkt_start(p_from);
+  v_hi := public.pkt_start(p_to + 1);
+  select * into r from public.restaurants where id = v_rid;
+  v_sales := r.waiter_can_view_sales;
+  v_comm := r.waiter_can_view_commission;
+  select e.commission_pct into v_pct from public.restaurant_employees e where e.id = v_emp;
+
+  return jsonb_build_object(
+    'sales_visible', v_sales, 'commission_visible', v_comm,
+    'commission_pct', case when v_comm then v_pct else null end,
+    'avg_order_value', case when v_sales then (
+        select round(avg(o.total), 2) from public.orders o
+         where o.waiter_id = v_emp and o.status = 'completed' and o.refunded_at is null
+           and o.completed_at >= v_lo and o.completed_at < v_hi) else null end,
+    'refunded_orders', (select count(*) from public.orders o
+                         where o.waiter_id = v_emp and o.refunded_at is not null
+                           and o.completed_at >= v_lo and o.completed_at < v_hi),
+    'commission_reversed', case when v_comm then coalesce((
+        select sum(sr.commission_amount) from public.sales_records sr
+         where sr.waiter_id = v_emp and sr.status = 'reversed'
+           and sr.completed_at >= v_lo and sr.completed_at < v_hi), 0) else null end,
+    'avg_minutes_to_complete', (
+        select round((avg(extract(epoch from (o.completed_at - o.created_at))) / 60)::numeric, 1)
+          from public.orders o
+         where o.waiter_id = v_emp and o.status = 'completed'
+           and o.completed_at >= v_lo and o.completed_at < v_hi),
+    'avg_minutes_to_accept_request', (
+        select round((avg(extract(epoch from (q.accepted_at - q.created_at))) / 60)::numeric, 1)
+          from public.waiter_requests q
+         where q.waiter_id = v_emp and q.accepted_at is not null
+           and q.accepted_at >= v_lo and q.accepted_at < v_hi),
+    'daily', coalesce((
+      select jsonb_agg(jsonb_build_object(
+               'date', to_char(g.d, 'YYYY-MM-DD'),
+               'orders', coalesce(o.cnt, 0),
+               'sales', case when v_sales then coalesce(o.sales, 0) else null end,
+               'commission', case when v_comm then coalesce(c.amt, 0) else null end) order by g.d)
+      from generate_series(p_from::timestamp, p_to::timestamp, interval '1 day') g(d)
+      left join (select (x.completed_at at time zone 'Asia/Karachi')::date as d, count(*) as cnt, sum(x.total) as sales
+                   from public.orders x
+                  where x.waiter_id = v_emp and x.status = 'completed' and x.refunded_at is null
+                    and x.completed_at >= v_lo and x.completed_at < v_hi
+                  group by 1) o on o.d = g.d::date
+      left join (select (sr.completed_at at time zone 'Asia/Karachi')::date as d, sum(sr.commission_amount) as amt
+                   from public.sales_records sr
+                  where sr.waiter_id = v_emp and sr.status = 'earned'
+                    and sr.completed_at >= v_lo and sr.completed_at < v_hi
+                  group by 1) c on c.d = g.d::date), '[]'::jsonb),
+    'top_items', coalesce((
+      select jsonb_agg(jsonb_build_object('name', t.name, 'quantity', t.qty,
+               'sales', case when v_sales then t.sales else null end) order by t.qty desc, t.name)
+      from (select i.name, sum(i.quantity) as qty, sum(i.line_total) as sales
+              from public.order_items i join public.orders o on o.id = i.order_id
+             where o.waiter_id = v_emp and o.status = 'completed' and o.refunded_at is null
+               and o.completed_at >= v_lo and o.completed_at < v_hi
+             group by i.name order by sum(i.quantity) desc, i.name limit 8) t), '[]'::jsonb),
+    'by_table', coalesce((
+      select jsonb_agg(jsonb_build_object('table', t.table_label, 'orders', t.cnt,
+               'sales', case when v_sales then t.sales else null end) order by t.cnt desc, t.table_label)
+      from (select o.table_label, count(*) as cnt, sum(o.total) as sales
+              from public.orders o
+             where o.waiter_id = v_emp and o.status = 'completed' and o.refunded_at is null
+               and o.completed_at >= v_lo and o.completed_at < v_hi
+             group by o.table_label order by count(*) desc, o.table_label limit 10) t), '[]'::jsonb),
+    'by_hour', coalesce((
+      select jsonb_agg(jsonb_build_object('hour', h.hr, 'orders', h.cnt) order by h.hr)
+      from (select extract(hour from o.created_at at time zone 'Asia/Karachi')::integer as hr, count(*) as cnt
+              from public.orders o
+             where o.waiter_id = v_emp and o.status <> 'cancelled'
+               and o.created_at >= v_lo and o.created_at < v_hi
+             group by 1) h), '[]'::jsonb)
+  );
+end $$;
+
 -- ---- Commission --------------------------------------------------------------
 -- Rules: only COMPLETED orders earn commission, once per order (sales_records.order_id
 -- is unique). Cancelled orders never earn. A refunded order's commission is
@@ -1656,22 +1751,28 @@ begin
                                where s.status = 'expired' or (s.status in ('trial', 'active') and s.expiry_date < v_today)),
     'suspended_restaurants', (select count(*) from public.restaurants where status = 'suspended'),
     'pending_payments', (select count(*) from public.subscription_payments where status = 'pending'),
-    'total_orders', (select count(*) from public.orders o where o.created_at >= v_lo and o.created_at < v_hi),
-    'total_sales', coalesce((select sum(o.total) from public.orders o
-                              where o.status = 'completed' and o.refunded_at is null
-                                and o.completed_at >= v_lo and o.completed_at < v_hi), 0),
-    'daily_sales', coalesce((
-      select jsonb_agg(jsonb_build_object('date', to_char(x.d, 'YYYY-MM-DD'), 'sales', x.s) order by x.d)
-      from (select (o.completed_at at time zone 'Asia/Karachi')::date as d, sum(o.total) as s
-              from public.orders o
-             where o.status = 'completed' and o.refunded_at is null and o.completed_at >= v_lo and o.completed_at < v_hi
+    -- The Super Admin sees the platform's OWN income (approved subscription payments), never a
+    -- restaurant's orders or sales.
+    'payments_approved', (select count(*) from public.subscription_payments p
+                           where p.status = 'approved'
+                             and coalesce(p.reviewed_at, p.created_at) >= v_lo and coalesce(p.reviewed_at, p.created_at) < v_hi),
+    'revenue', coalesce((select sum(p.amount) from public.subscription_payments p
+                          where p.status = 'approved'
+                            and coalesce(p.reviewed_at, p.created_at) >= v_lo and coalesce(p.reviewed_at, p.created_at) < v_hi), 0),
+    'daily_revenue', coalesce((
+      select jsonb_agg(jsonb_build_object('date', to_char(x.d, 'YYYY-MM-DD'), 'revenue', x.s) order by x.d)
+      from (select (coalesce(p.reviewed_at, p.created_at) at time zone 'Asia/Karachi')::date as d, sum(p.amount) as s
+              from public.subscription_payments p
+             where p.status = 'approved'
+               and coalesce(p.reviewed_at, p.created_at) >= v_lo and coalesce(p.reviewed_at, p.created_at) < v_hi
              group by 1) x), '[]'::jsonb),
-    'top_restaurants', coalesce((
-      select jsonb_agg(jsonb_build_object('restaurant', x.name, 'orders', x.cnt, 'sales', x.sales) order by x.sales desc)
-      from (select r.name, count(*) as cnt, sum(o.total) as sales
-              from public.orders o join public.restaurants r on r.id = o.restaurant_id
-             where o.status = 'completed' and o.refunded_at is null and o.completed_at >= v_lo and o.completed_at < v_hi
-             group by r.id, r.name order by sum(o.total) desc limit 10) x), '[]'::jsonb)
+    'revenue_by_plan', coalesce((
+      select jsonb_agg(jsonb_build_object('plan', x.name, 'payments', x.cnt, 'revenue', x.amt) order by x.amt desc)
+      from (select pl.name, count(*) as cnt, sum(p.amount) as amt
+              from public.subscription_payments p join public.subscription_plans pl on pl.code = p.plan_code
+             where p.status = 'approved'
+               and coalesce(p.reviewed_at, p.created_at) >= v_lo and coalesce(p.reviewed_at, p.created_at) < v_hi
+             group by pl.code, pl.name) x), '[]'::jsonb)
   );
 end $$;
 
@@ -1735,127 +1836,4 @@ begin
 end $$;
 
 create or replace function public.admin_save_plan(
-  p_code text, p_name text, p_price numeric, p_duration_days integer, p_is_active boolean, p_description text
-) returns void
-language plpgsql security definer set search_path = ''
-as $$
-begin
-  perform public._require_super();
-  if char_length(btrim(coalesce(p_name, ''))) not between 1 and 60 then
-    raise exception 'Plan name is required (maximum 60 characters).';
-  end if;
-  if p_price is null or p_price < 0 or p_price > 10000000 then
-    raise exception 'The price is not valid.';
-  end if;
-  if p_duration_days is null or p_duration_days not between 1 and 3660 then
-    raise exception 'Duration must be between 1 and 3660 days.';
-  end if;
-  update public.subscription_plans
-     set name = btrim(p_name), price_pkr = p_price, duration_days = p_duration_days,
-         is_active = coalesce(p_is_active, true), description = left(btrim(coalesce(p_description, '')), 500)
-   where code = p_code;
-  if not found then
-    raise exception 'Plan not found.';
-  end if;
-  perform public.log_audit('plan.update', 'subscription_plan', null, null,
-    jsonb_build_object('code', p_code, 'price_pkr', p_price, 'duration_days', p_duration_days, 'is_active', p_is_active));
-end $$;
-
-create or replace function public.admin_set_subscription(
-  p_restaurant_id uuid, p_plan_code text, p_status text, p_start date, p_expiry date
-) returns void
-language plpgsql security definer set search_path = ''
-as $$
-begin
-  perform public._require_super();
-  if p_status not in ('trial', 'active', 'expired', 'suspended') then
-    raise exception 'Invalid subscription status.';
-  end if;
-  if p_start is null or p_expiry is null or p_expiry < p_start then
-    raise exception 'The expiry date must be on or after the start date.';
-  end if;
-  if not exists (select 1 from public.restaurants where id = p_restaurant_id) then
-    raise exception 'Restaurant not found.';
-  end if;
-  if not exists (select 1 from public.subscription_plans where code = p_plan_code) then
-    raise exception 'Plan not found.';
-  end if;
-  insert into public.subscriptions (restaurant_id, plan_code, status, start_date, expiry_date)
-  values (p_restaurant_id, p_plan_code, p_status, p_start, p_expiry)
-  on conflict (restaurant_id) do update
-    set plan_code = excluded.plan_code, status = excluded.status,
-        start_date = excluded.start_date, expiry_date = excluded.expiry_date;
-  perform public.log_audit('subscription.set', 'subscription', null, p_restaurant_id,
-    jsonb_build_object('plan', p_plan_code, 'status', p_status, 'start', p_start, 'expiry', p_expiry));
-end $$;
-
-create or replace function public.admin_renew_subscription(p_restaurant_id uuid, p_plan_code text, p_days integer)
-returns void
-language plpgsql security definer set search_path = ''
-as $$
-declare v_new date;
-begin
-  perform public._require_super();
-  if not exists (select 1 from public.restaurants where id = p_restaurant_id) then
-    raise exception 'Restaurant not found.';
-  end if;
-  v_new := public._apply_renewal(p_restaurant_id, p_plan_code, p_days, auth.uid());
-  perform public.log_audit('subscription.renew', 'subscription', null, p_restaurant_id,
-    jsonb_build_object('plan', p_plan_code, 'days', p_days, 'new_expiry', v_new));
-end $$;
-
-create or replace function public.admin_extend_subscription(p_restaurant_id uuid, p_days integer) returns void
-language plpgsql security definer set search_path = ''
-as $$
-declare s public.subscriptions; v_new date; v_status text;
-begin
-  perform public._require_super();
-  if p_days is null or p_days < 1 or p_days > 3660 then
-    raise exception 'Days must be between 1 and 3660.';
-  end if;
-  select * into s from public.subscriptions where restaurant_id = p_restaurant_id for update;
-  if not found then
-    raise exception 'This restaurant has no subscription yet. Use Renew or Set manually first.';
-  end if;
-  v_new := greatest(s.expiry_date, public.pkt_today()) + p_days;
-  v_status := case when s.status = 'expired' then (case when s.plan_code = 'free_trial' then 'trial' else 'active' end)
-                   else s.status end;
-  update public.subscriptions set expiry_date = v_new, status = v_status where id = s.id;
-  insert into public.restaurant_messages (restaurant_id, title, body, kind, created_by)
-  values (p_restaurant_id, 'Subscription extended',
-          format('Your subscription was extended and now ends on %s.', to_char(v_new, 'DD Mon YYYY')),
-          'subscription', auth.uid());
-  perform public.log_audit('subscription.extend', 'subscription', s.id, p_restaurant_id,
-    jsonb_build_object('days', p_days, 'new_expiry', v_new));
-end $$;
-
-create or replace function public.admin_send_expiry_reminders(p_within_days integer) returns integer
-language plpgsql security definer set search_path = ''
-as $$
-declare v_today date := public.pkt_today(); v_custom text; v_count integer := 0; r record;
-begin
-  perform public._require_super();
-  if p_within_days is null or p_within_days not between 1 and 60 then
-    raise exception 'Days must be between 1 and 60.';
-  end if;
-  select nullif(btrim(s.value #>> '{}'), '') into v_custom
-    from public.system_settings s where s.key = 'subscription_reminder_text';
-  for r in
-    select s.restaurant_id, s.expiry_date, pl.name as plan_name
-      from public.subscriptions s
-      join public.restaurants rs on rs.id = s.restaurant_id and rs.status = 'active'
-      join public.subscription_plans pl on pl.code = s.plan_code
-     where s.status in ('trial', 'active') and s.expiry_date between v_today and v_today + p_within_days
-       and not exists (select 1 from public.restaurant_messages m
-                        where m.restaurant_id = s.restaurant_id and m.kind = 'expiry_reminder'
-                          and m.created_at >= public.pkt_start(v_today))
-  loop
-    insert into public.restaurant_messages (restaurant_id, title, body, kind, created_by)
-    values (r.restaurant_id, 'Subscription ending soon',
-            coalesce(v_custom || E'\n\n', '') ||
-            format('Your %s subscription ends on %s (%s day(s) left). Please renew it from the Subscription page.',
-                   r.plan_name, to_char(r.expiry_date, 'DD Mon YYYY'), r.expiry_date - v_today),
-            'expiry_reminder', auth.uid());
-    v_count := v_count + 1;
-  end loop;
-  perform public.log_audit('subscriptio
+  p_code text, p_name text, p_price numeric, p_duration_days integer, p_is_activ
