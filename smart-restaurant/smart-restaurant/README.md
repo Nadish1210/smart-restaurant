@@ -134,7 +134,8 @@ supabase functions deploy ai-assistant --no-verify-jwt
 1. Sign in to the dashboard as the Super Admin. Create a restaurant (owner name, email, temporary password). Choose a plan.
 2. Sign in as the Owner (use a private window). Add menu categories and items, add tables, then download each table's QR code and print it.
 3. Create waiters from the Owner's staff screen.
-4. Scan a QR code with a real phone, place an order, and watch it appear in the dashboard (it refreshes about every 10 seconds).
+4. **Give every table a waiter** (Tables page, or the waiter's own card in Staff). A waiter can look after many tables. Orders and requests from a table go to that table's waiter only.
+5. Scan a QR code with a real phone, place an order, and watch it appear in the dashboard (it refreshes about every 10 seconds).
 
 ---
 
@@ -157,10 +158,17 @@ Tick each item after you see it work.
 - [ ] "Call waiter / bill / water" requests show up for staff.
 - [ ] The Orders tab shows status changes.
 
+**Table-wise waiters**
+- [ ] Each waiter sees only the orders and requests of their own tables, and nothing else.
+- [ ] A table with no waiter shows a warning to the Owner, and its orders cannot be advanced until a waiter is assigned.
+- [ ] If the Owner (or kitchen) moves an order along, the commission still goes to the table's waiter.
+- [ ] "Move all tables" (waiter on leave) hands every table, and its open orders and requests, to another waiter. Completed orders keep their original waiter and commission.
+- [ ] Deactivating a waiter frees their tables (they show as "no waiter").
+
 **Staff flow**
 - [ ] A new order appears within about 10 seconds. Status moves Pending → Preparing → Ready → Served → Completed.
 - [ ] Invalid jumps (for example Pending → Completed) are refused.
-- [ ] Completing an order records revenue, and the waiter who first handled it is credited.
+- [ ] Completing an order records revenue, and the table's waiter is credited.
 - [ ] A refund reverses revenue and commission.
 
 **Tenant isolation (important)**
@@ -187,8 +195,8 @@ Create two restaurants, A and B, each with an owner and a waiter.
 I ran these in a development sandbox:
 - `node --test tests/customer_core.test.js`: 11 customer-logic tests, **passed**.
 - `node --test tests/edge_functions.test.js`: 17 tests of the Edge Function logic using fake database and Gemini clients, **passed**.
-- `tests/test_backend.py`: 19 passed, 1 skipped (run with a small stand-in runner because `pytest` could not be installed there).
-- `database.sql` loaded on a local Postgres 16 with small stand-ins for Supabase's `auth` and `storage` schemas, and `tests/test_database.py` passed 282 of 282 checks (tenant isolation, role limits, order rules, refunds, subscriptions).
+- `tests/test_backend.py`: 21 passed, 1 skipped (run with a small stand-in runner because `pytest` could not be installed there).
+- `database.sql` loaded on a local Postgres 16 with small stand-ins for Supabase's `auth` and `storage` schemas, and `tests/test_database.py` passed 333 of 333 checks (tenant isolation, role limits, order rules, refunds, subscriptions, table-wise waiter assignment).
 - The customer page was exercised in headless Chromium against the real SQL functions through a small local shim.
 
 **Not tested** (you must verify these yourself with the checklist above):
@@ -204,6 +212,7 @@ I ran these in a development sandbox:
 ## 6. Honest feature status
 
 **Built**
+- Table-wise waiters: each table belongs to one waiter (a waiter has many tables). Orders and requests go to that table's waiter, who is the only waiter who sees them and who earns the commission. The Owner can reassign a table, or move all of a waiter's tables when they are on leave. The Owner does not assign individual orders.
 - Three roles with database-enforced permissions (Row Level Security, column-level grants, role checks inside functions).
 - QR table ordering with server-calculated prices and totals, duplicate-submission protection, and per-table throttling.
 - Order status workflow, waiter requests, menu, tables, expenses, staff, commissions, refunds, and revenue reports (Pakistan time).
@@ -240,7 +249,7 @@ node --test tests/customer_core.test.js
 node --test tests/edge_functions.test.js     # needs Node 22.6 or newer
 pip install pytest && pytest tests/test_backend.py
 ```
-Database tests (a throwaway local Postgres 16 on Linux only, never your Supabase project). The setup commands are at the top of `tests/test_database.py`; the last line it prints is `282/282 checks passed` when everything works.
+Database tests (a throwaway local Postgres 16 on Linux only, never your Supabase project). The setup commands are at the top of `tests/test_database.py`; the last line it prints is `333/333 checks passed` when everything works.
 Run `node --test` with the file path, not with the folder name.
 
 ---
