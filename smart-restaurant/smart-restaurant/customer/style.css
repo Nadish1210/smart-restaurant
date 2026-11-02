@@ -25,9 +25,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .top h1 { font-size: 1.35rem; }
 .logo { width: 52px; height: 52px; border-radius: 12px; object-fit: cover; background: var(--card); border: 1px solid var(--line); }
 
-.tabs { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; background: var(--card); border: 1px solid var(--line);
+.tabs { display: grid; grid-template-columns: repeat(5, 1fr); gap: 2px; background: var(--card); border: 1px solid var(--line);
         border-radius: var(--radius); padding: 4px; position: sticky; top: 6px; z-index: 5; }
-.tabs button { min-height: 42px; border: 0; background: transparent; border-radius: 10px; font-weight: 600; color: var(--muted); }
+.tabs button { min-height: 42px; border: 0; background: transparent; border-radius: 10px; font-weight: 600; color: var(--muted); font-size: .9rem; padding: 0 2px; }
 .tabs button[aria-selected="true"] { background: var(--primary); color: var(--on-primary); }
 
 main { margin-top: 14px; }
@@ -108,3 +108,27 @@ ul.plain li { display: flex; justify-content: space-between; gap: 10px; padding:
 .fatal h1 { font-size: 1.3rem; margin-bottom: 8px; }
 .small { font-size: .85rem; color: var(--muted); }
 @media (prefers-reduced-motion: reduce) { .toast { transition: none; } }
+
+.site-foot { text-align: center; padding: 18px 0 6px; }
+.pay-grid { display: grid; grid-template-columns: 1fr; gap: 10px; margin-top: 10px; }
+.pay-grid button { min-height: 56px; border-radius: var(--radius); background: var(--card); border: 1px solid var(--line); font-weight: 700; text-align: left; padding: 0 14px; }
+.pay-grid button[aria-pressed="true"] { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary) inset; }
+.pre { white-space: pre-wrap; word-break: break-word; }
+.proof-preview { max-width: 100%; max-height: 240px; border-radius: 12px; border: 1px solid var(--line); margin: 8px 0; display: block; }
+.stamp { display: inline-block; font-weight: 800; letter-spacing: .04em; padding: 4px 12px; border: 3px solid var(--primary); color: var(--primary);
+         border-radius: 8px; transform: rotate(-4deg); }
+.stamp.unpaid { border-color: var(--danger); color: var(--danger); }
+.bill h2 { font-size: 1.2rem; }
+.bill .bill-head { display: flex; gap: 12px; align-items: center; margin-bottom: 8px; }
+.bill table { width: 100%; border-collapse: collapse; margin: 8px 0; }
+.bill td { padding: 3px 0; vertical-align: top; }
+.bill td:last-child { text-align: right; white-space: nowrap; }
+.bill hr { border: 0; border-top: 1px dashed var(--line); margin: 8px 0; }
+@media print {
+  body { background: #fff; color: #000; }
+  .top, .tabs, main, .cart-bar, #sheet, #toast, .site-foot, .no-print { display: none !important; }
+  #app { padding: 0; max-width: none; }
+  #infoSheet { position: static; background: none; display: block; }
+  #infoSheet .sheet-card { max-height: none; overflow: visible; background: #fff; border-radius: 0; padding: 0; max-width: none; }
+  .bill, .bill * { color: #000 !important; }
+}

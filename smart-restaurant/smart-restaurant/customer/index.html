@@ -27,6 +27,7 @@
       <button role="tab" id="tab-menu" data-tab="menu" aria-selected="true" aria-controls="view-menu">Menu</button>
       <button role="tab" id="tab-suggest" data-tab="suggest" aria-selected="false" aria-controls="view-suggest">Ideas</button>
       <button role="tab" id="tab-orders" data-tab="orders" aria-selected="false" aria-controls="view-orders">Orders</button>
+      <button role="tab" id="tab-bill" data-tab="bill" aria-selected="false" aria-controls="view-bill">Bill</button>
       <button role="tab" id="tab-help" data-tab="help" aria-selected="false" aria-controls="view-help">Help</button>
     </nav>
 
@@ -46,10 +47,18 @@
         <div id="ordersBody"></div>
       </section>
 
+      <section id="view-bill" role="tabpanel" aria-labelledby="tab-bill" hidden>
+        <div id="billBody"></div>
+      </section>
+
       <section id="view-help" role="tabpanel" aria-labelledby="tab-help" hidden>
         <div id="helpBody"></div>
       </section>
     </main>
+
+    <footer class="site-foot">
+      <button id="openTerms" type="button" class="link">Terms &amp; Conditions</button>
+    </footer>
 
     <div id="cartBar" class="cart-bar" hidden>
       <button id="openCart" type="button" class="primary wide"></button>
@@ -62,6 +71,16 @@
           <button id="closeSheet" type="button" class="icon" aria-label="Close">✕</button>
         </div>
         <div id="sheetBody"></div>
+      </div>
+    </div>
+
+    <div id="infoSheet" class="sheet" role="dialog" aria-modal="true" aria-labelledby="infoTitle" hidden>
+      <div class="sheet-card">
+        <div class="sheet-head no-print">
+          <h2 id="infoTitle"></h2>
+          <button id="closeInfo" type="button" class="icon" aria-label="Close">✕</button>
+        </div>
+        <div id="infoBody"></div>
       </div>
     </div>
 
