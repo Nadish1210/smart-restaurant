@@ -65,7 +65,7 @@ class SmartRestaurantAPI():
   refund_order(order_id, reason)
   list_requests(statuses, date_from, date_to)
   update_request_status(request_id, new_status)
-  list_employees() ; create_employee(email, full_name, password, phone,
+  cancel_flags() [owner] ; list_feedback(from, to) ; delete_feedback(id) ; mark_kitchen_tips_given() ; list_employees() ; change_employee_email(employee_id, new_email) ; remove_employee(employee_id) ; create_employee(email, full_name, password, phone,
       commission_pct) ; update_employee(employee_id, full_name, phone,
       commission_pct, is_active)
   commission_report(date_from, date_to, waiter_id) ; commission_history(
@@ -81,7 +81,8 @@ class SmartRestaurantAPI():
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+import base64
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -114,13 +115,16 @@ DEFAULT_LABELS: dict[str, str] = {
     "nav_orders": "Orders",
     "nav_kitchen": "Kitchen",
     "nav_requests": "Customer Requests",
+    "nav_payments": "Bills & Payments",
     "nav_menu": "Menu",
     "nav_tables": "Tables & QR",
-    "nav_staff": "Waiters & Staff",
+    "nav_staff": "Service Providers & Staff",
     "nav_commission": "Commission",
     "nav_inventory": "Inventory",
     "nav_expenses": "Expenses",
     "nav_analytics": "Sales Analytics",
+    "nav_feedback": "Customer Feedback",
+    "nav_forecast": "Demand Forecast",
     "nav_restaurant": "Restaurant Profile",
     "nav_subscription": "Subscription",
     "nav_messages": "Messages",
@@ -132,9 +136,9 @@ NAV_ICONS = {
     "admin_overview": "📊", "admin_restaurants": "🏪", "admin_plans": "💳",
     "admin_subscriptions": "🗓️", "admin_payments": "🧾", "admin_messages": "📣",
     "admin_settings": "🛠️", "admin_ai": "🤖", "admin_audit": "📜",
-    "dashboard": "📊", "orders": "🧾", "kitchen": "🍳", "requests": "🔔",
+    "dashboard": "📊", "orders": "🧾", "kitchen": "🍳", "requests": "🔔", "payments": "💵",
     "menu": "📖", "tables": "🪑", "staff": "🧑‍🍳", "commission": "💰",
-    "inventory": "📦", "expenses": "💸", "analytics": "📈", "restaurant": "🏪",
+    "inventory": "📦", "expenses": "💸", "analytics": "📈", "feedback": "⭐", "forecast": "🔮", "restaurant": "🏪",
     "subscription": "💳", "messages": "✉️", "my_stats": "📈", "account": "👤",
 }
 
@@ -145,13 +149,13 @@ ROLE_PAGES = {
         "admin_audit", "account",
     ],
     "owner": [
-        "dashboard", "orders", "kitchen", "requests", "menu", "tables", "staff",
-        "commission", "inventory", "expenses", "analytics", "restaurant",
+        "dashboard", "orders", "kitchen", "requests", "payments", "menu", "tables", "staff",
+        "commission", "inventory", "expenses", "analytics", "forecast", "feedback", "restaurant",
         "subscription", "messages", "account",
     ],
-    "waiter": ["orders", "kitchen", "requests", "my_stats", "account"],
+    "waiter": ["orders", "kitchen", "requests", "payments", "my_stats", "account"],
 }
-ROLE_TITLES = {"super_admin": "Super Admin", "owner": "Restaurant Owner", "waiter": "Waiter"}
+ROLE_TITLES = {"super_admin": "Super Admin", "owner": "Restaurant Owner", "waiter": "Service Provider"}
 
 ORDER_BADGE = {
     "received": "🆕 Received", "confirmed": "✅ Confirmed", "preparing": "👨‍🍳 Preparing",
@@ -447,18 +451,10 @@ def render_login(api) -> None:
                         st.session_state.pop("labels", None)
                         st.rerun()
         with tab_forgot:
-            st.caption(settings.get("forgot_password_text")
-                       or "Enter your account email and we will send you a reset link.")
-            with st.form("forgot_form"):
-                email = st.text_input("Account email")
-                submitted = st.form_submit_button("Send reset link", type="primary")
-            if submitted:
-                if "@" not in email:
-                    st.error("Please enter a valid email address.")
-                else:
-                    attempt(api.send_password_reset, email.strip())
-                    # Same message whether or not the account exists (no user enumeration).
-                    st.success("If that email belongs to an account, a reset link is on its way.")
+            st.info(settings.get("forgot_password_text")
+                    or "Forgot your password? Please contact your restaurant owner (service providers) "
+                       "or the platform administrator (owners). They will set a new password "
+                       "for you, and you can then sign in straight away.")
 
 
 def render_recovery(api, token_hash: str) -> None:
@@ -663,7 +659,7 @@ def _admin_restaurant_list(api) -> None:
                         st.rerun()
             else:
                 with st.expander("⏸️ Suspend restaurant"):
-                    st.warning("Owner and waiters will lose access until you activate it again.")
+                    st.warning("Owner and service providers will lose access until you activate it again.")
                     sure = st.checkbox("I understand", key=f"susp_c_{rid}")
                     if st.button("Suspend", key=f"susp_{rid}", disabled=not sure):
                         ok, _ = attempt(api.admin_set_restaurant_status, rid, "suspended")
@@ -671,6 +667,20 @@ def _admin_restaurant_list(api) -> None:
                             flash("Restaurant suspended.", "warning")
                             st.rerun()
         with c2:
+            if r.get("owner_email"):
+                with st.expander("🔑 Set a new password for the owner"):
+                    st.caption(f"Owner: {r['owner_email']}")
+                    with st.form(f"owner_pw_{rid}", clear_on_submit=True):
+                        npw = st.text_input("New password", type="password",
+                                            help="Tell the owner privately. They can sign in with it immediately.")
+                        if st.form_submit_button("Set new password"):
+                            problem = valid_password(npw)
+                            if problem:
+                                st.error(problem)
+                            else:
+                                ok, _ = attempt(api.reset_user_password, r["owner_email"], npw)
+                                if ok:
+                                    st.success("Owner password changed.")
             with st.expander("👤 Assign or replace owner"):
                 st.caption("Use an existing owner email, or enter a name and temporary password "
                            "to create a new owner account.")
@@ -986,6 +996,28 @@ def page_admin_audit(api) -> None:
 # ---------------------------------------------------------------------------
 # ORDERS / KITCHEN
 # ---------------------------------------------------------------------------
+def _promise_line(o: dict) -> None:
+    """Shows the promised time, how long is left, and the late-service discount for an order."""
+    mins = o.get("promised_minutes")
+    if not mins:
+        return
+    pct = float(o.get("late_discount_pct") or 0)
+    if float(o.get("discount") or 0) > 0:
+        st.warning(f"⏱ Served late (promised {mins} min). Late-service discount of {_money(o['discount'])} was given.")
+        return
+    if o["status"] in ("served", "completed", "cancelled"):
+        return
+    placed = _parse_dt(o.get("created_at"))
+    if not placed:
+        return
+    left = mins - (datetime.now(timezone.utc) - placed).total_seconds() / 60
+    perk = f" Customer gets {pct:g}% off if it is served late (and unpaid)." if pct > 0 else ""
+    if left >= 0:
+        st.caption(f"⏱ Promised in {mins} min · {int(left)} min left.{perk}")
+    else:
+        st.error(f"⏱ LATE by {int(-left)} min (promised {mins} min).{perk}")
+
+
 def _order_card(api, o: dict, prefix: str, allow_cancel: bool) -> None:
     status = o["status"]
     with st.container(border=True):
@@ -993,9 +1025,10 @@ def _order_card(api, o: dict, prefix: str, allow_cancel: bool) -> None:
         h1.markdown(f"**#{o['order_number']}** · Table **{o.get('table_label') or '?'}**")
         h2.markdown(f"{ORDER_BADGE.get(status, status)} · **{_money(o['total'])}**")
         st.caption(f"Placed {fmt_dt(o['created_at'])}"
-                   + (f" · Waiter: {o['waiter_name']}" if o.get("waiter_name") else ""))
+                   + (f" · Service Provider: {o['waiter_name']}" if o.get("waiter_name") else "")
+                   + (f" · ✅ Paid ({backend.BILL_METHODS.get(o.get('payment_method'), '')})" if o.get("paid_at") else " · 💤 Not paid yet"))
         if not o.get("waiter_id") and status in backend.ORDER_TRANSITIONS and backend.ORDER_TRANSITIONS.get(status):
-            st.warning(f"Table {o.get('table_label') or '?'} has no waiter yet. "
+            st.warning(f"Table {o.get('table_label') or '?'} has no service provider yet. "
                        "Assign one in Tables so this order can be handled.")
             return
         for it in o.get("items", []):
@@ -1005,6 +1038,7 @@ def _order_card(api, o: dict, prefix: str, allow_cancel: bool) -> None:
             st.markdown(f"- {line}")
         if o.get("notes"):
             st.info(f"📝 {o['notes']}")
+        _promise_line(o)
         nexts = backend.ORDER_TRANSITIONS.get(status, [])
         forward = [s for s in nexts if s != "cancelled"]
         can_cancel = allow_cancel and "cancelled" in nexts
@@ -1071,6 +1105,11 @@ def page_orders(api) -> None:
     is_owner = api.ctx["role"] == "owner"
     tab_live, tab_hist = st.tabs(["Live orders", "History"])
     with tab_live:
+        if is_owner:
+            ok_f, flags = attempt(api.cancel_flags)
+            if ok_f and flags:
+                st.warning("⚠️ Possible fake orders — many customer cancellations in the last 24 hours: "
+                           + ", ".join(f"Table {f['table_label']} ({f['cancels']})" for f in flags))
         _live_orders(api, "orders", ACTIVE_ORDER_STATUSES, group=True, allow_cancel=is_owner)
     with tab_hist:
         start, end = date_filter("ord_hist", "Last 7 days")
@@ -1087,7 +1126,7 @@ def page_orders(api) -> None:
             o["status_label"] = ORDER_BADGE.get(o["status"], o["status"])
             o["refunded"] = "Yes" if o.get("refunded_at") else ""
         show_table(orders, {"order_number": "Order #", "table_label": "Table", "status_label": "Status",
-                            "total": "Total", "waiter_name": "Waiter", "refunded": "Refunded",
+                            "total": "Total", "waiter_name": "Service Provider", "refunded": "Refunded",
                             "created_at": "Placed"}, money=("total",), dts=("created_at",),
                    empty="No orders match these filters.")
         if orders:
@@ -1194,6 +1233,77 @@ def page_requests(api) -> None:
                        dts=("created_at",))
 
 
+def _proof_image(data_url: str) -> None:
+    try:
+        raw = base64.b64decode(data_url.split(",", 1)[1], validate=True)
+        st.image(raw, caption="Customer's payment screenshot", width=280)
+    except Exception:  # noqa: BLE001 - a broken image must never break the page
+        st.warning("The screenshot could not be shown.")
+
+
+def _payment_card(api, p: dict) -> None:
+    with st.container(border=True):
+        h1, h2 = st.columns([3, 2])
+        h1.markdown(f"Table **{p.get('table_label') or '?'}** · {backend.BILL_METHODS.get(p['method'], p['method'])}")
+        h2.markdown(f"**{_money(p['amount'])}**")
+        if float(p.get("tip_amount") or 0) > 0:
+            st.caption(f"💝 Includes a tip of {_money(p['tip_amount'])} (not part of the bill or commission).")
+        orders = ", ".join(f"#{n}" for n in (p.get("order_numbers") or []))
+        st.caption(f"Orders {orders} · requested {fmt_dt(p['created_at'])}"
+                   + (f" · Service Provider: {p['waiter_name']}" if p.get("waiter_name") else ""))
+        if p.get("proof_image"):
+            _proof_image(p["proof_image"])
+        hint = {"cash": "The customer will pay cash. Confirm only after you have received it.",
+                "card": "Take the customer's card payment, then confirm it here.",
+                "online": "Check your own account/app that the money arrived before approving."}.get(p["method"], "")
+        if hint:
+            st.info(hint)
+        reason = st.text_input("Reason if rejecting (the customer sees it)", key=f"pay_r_{p['id']}", max_chars=200)
+        c1, c2 = st.columns(2)
+        label = "✅ Payment received" if p["method"] != "online" else "✅ Approve payment"
+        if c1.button(label, key=f"pay_ok_{p['id']}", type="primary"):
+            ok, _ = attempt(api.decide_payment, p["id"], True)
+            if ok:
+                flash("Payment confirmed. The customer can see it.")
+                _rerun()
+        if c2.button("❌ Reject", key=f"pay_no_{p['id']}"):
+            ok, _ = attempt(api.decide_payment, p["id"], False, reason)
+            if ok:
+                flash("Payment rejected.", "warning")
+                _rerun()
+
+
+def page_payments(api) -> None:
+    _title("payments", "Customers pay from their phone. Confirm each payment here so it is counted.")
+    tab_live, tab_hist = st.tabs(["Waiting for you", "History"])
+    with tab_live:
+        auto = st.toggle("Auto-refresh (10s)", value=True, key="pay_auto")
+
+        @st.fragment(run_every=10 if auto else None)
+        def board() -> None:
+            ok, rows = attempt(api.list_payments, "pending", 50)
+            if not ok:
+                return
+            st.caption(f"{len(rows)} payment(s) waiting · updated {datetime.now(TZ):%I:%M:%S %p}")
+            if not rows:
+                st.info("No payments are waiting.")
+            for p in rows:
+                _payment_card(api, p)
+
+        board()
+    with tab_hist:
+        status = st.selectbox("Show", ["approved", "rejected", "cancelled", "all"], key="pay_hist_status")
+        ok, rows = attempt(api.list_payments, status, 100)
+        if ok:
+            for r in rows:
+                r["method_label"] = backend.BILL_METHODS.get(r["method"], r["method"])
+                r["orders_label"] = ", ".join(f"#{n}" for n in (r.get("order_numbers") or []))
+            show_table(rows, {"created_at": "Requested", "table_label": "Table", "orders_label": "Orders",
+                              "method_label": "Method", "amount": "Amount", "status": "Status",
+                              "waiter_name": "Service Provider", "reject_reason": "Reason"},
+                       money=("amount",), dts=("created_at",), empty="Nothing here yet.")
+
+
 # ---------------------------------------------------------------------------
 # OWNER pages
 # ---------------------------------------------------------------------------
@@ -1236,14 +1346,31 @@ def page_restaurant(api) -> None:
         address = st.text_input("Address", value=r.get("address") or "")
         city = st.text_input("City", value=r.get("city") or "")
         st.markdown("**Operations**")
-        basis = st.radio("Waiter commission is calculated on", ["gross", "net"], horizontal=True,
+        basis = st.radio("Service Provider commission is calculated on", ["gross", "net"], horizontal=True,
                          index=0 if r.get("commission_basis", "gross") == "gross" else 1,
                          format_func=lambda b: "Gross sales" if b == "gross" else "Net sales (after discounts)")
         esc = st.number_input("Escalate unanswered customer requests to manager after (minutes)",
                               min_value=1, max_value=120, value=int(r.get("escalation_minutes") or 5))
         c3, c4 = st.columns(2)
-        see_sales = c3.checkbox("Waiters can see sales summaries", value=bool(r.get("waiter_can_view_sales")))
-        see_comm = c4.checkbox("Waiters can see their commission", value=bool(r.get("waiter_can_view_commission")))
+        see_sales = c3.checkbox("Service Providers can see sales summaries", value=bool(r.get("waiter_can_view_sales")))
+        see_comm = c4.checkbox("Service Providers can see their commission", value=bool(r.get("waiter_can_view_commission")))
+        st.markdown("**Customer billing**")
+        pay_info = st.text_area("How customers pay online (shown to them)", value=r.get("payment_instructions") or "",
+                                max_chars=500, height=90,
+                                help="Example: Easypaisa 0300-1234567 (Account name). Customers send a screenshot after paying.")
+        st.markdown("**Service promise**")
+        p1, p2 = st.columns(2)
+        late_pct = p1.number_input("Late-service discount (%)", min_value=0.0, max_value=100.0, step=1.0,
+                                   value=float(r.get("late_discount_pct") or 0),
+                                   help="If an order is not served within its promised time, the customer gets this % off "
+                                        "(0 = off). The promised time is the longest preparation time among the dishes "
+                                        "ordered; set it on each dish in Menu. Applied only if the bill is still unpaid "
+                                        "when the order is served.")
+        cancel_win = p2.number_input("Customer can cancel within (minutes)", min_value=0, max_value=60, step=1,
+                                     value=int(r.get("cancel_window_minutes") or 0),
+                                     help="0 = customers cannot cancel from their phone. Only before the kitchen starts preparing.")
+        terms = st.text_area("Terms and conditions (customers can read them from the menu page)",
+                             value=r.get("terms_text") or "", max_chars=5000, height=180)
         logo = st.file_uploader("Logo (PNG, JPG or WebP, max 2 MB)", type=["png", "jpg", "jpeg", "webp"])
         if st.form_submit_button("Save profile", type="primary"):
             if not name.strip():
@@ -1253,7 +1380,9 @@ def page_restaurant(api) -> None:
                     fields = {"name": name.strip(), "phone": phone.strip(), "email": email.strip(),
                               "address": address.strip(), "city": city.strip(), "commission_basis": basis,
                               "escalation_minutes": int(esc), "waiter_can_view_sales": see_sales,
-                              "waiter_can_view_commission": see_comm}
+                              "waiter_can_view_commission": see_comm,
+                              "payment_instructions": pay_info, "terms_text": terms,
+                              "late_discount_pct": float(late_pct), "cancel_window_minutes": int(cancel_win)}
                     up = read_upload(logo, 2)
                     if up:
                         fields["logo_url"] = api.upload_logo(*up)
@@ -1282,6 +1411,12 @@ def _item_form(api, item: dict | None, categories: list[dict], key: str) -> None
         avail = c3.checkbox("Available now", value=bool(item.get("is_available", True)))
         feat = c4.checkbox("Featured", value=bool(item.get("is_featured")))
         pop = c5.checkbox("Popular", value=bool(item.get("is_popular")))
+        c6, c7, c8 = st.columns(3)
+        kids = c6.checkbox("Kids meal", value=bool(item.get("is_kids")))
+        fam = c7.checkbox("Family deal", value=bool(item.get("is_family")))
+        mild = c8.checkbox("Mild spice", value=bool(item.get("is_mild")))
+        prep = st.number_input("Preparation time (minutes, 0 = not shown to customers)", min_value=0, max_value=240,
+                               step=1, value=int(item.get("prep_minutes") or 0))
         if item.get("image_url"):
             st.image(item["image_url"], width=140)
         img = st.file_uploader("Image (PNG, JPG or WebP, max 3 MB)", type=["png", "jpg", "jpeg", "webp"],
@@ -1296,7 +1431,8 @@ def _item_form(api, item: dict | None, categories: list[dict], key: str) -> None
                     payload = {"id": item.get("id"), "name": name.strip(), "category_id": cat,
                                "price": price, "cost_price": cost or None, "description": desc.strip(),
                                "is_available": avail, "is_featured": feat, "is_popular": pop,
-                               "image_url": item.get("image_url")}
+                               "is_kids": kids, "is_family": fam, "is_mild": mild,
+                               "image_url": item.get("image_url"), "prep_minutes": int(prep) or None}
                     up = read_upload(img, 3)
                     if up:
                         payload["image_url"] = api.upload_menu_image(*up)
@@ -1414,16 +1550,16 @@ def page_tables(api) -> None:
     else:
         unassigned = [t["label"] for t in tables if t.get("is_active", True) and not t.get("waiter_id")]
         if unassigned:
-            st.warning("Tables without a waiter: **" + ", ".join(unassigned) + "**. Orders from these tables "
-                       "cannot be handled until you assign a waiter.")
+            st.warning("Tables without a service provider: **" + ", ".join(unassigned) + "**. Orders from these tables "
+                       "cannot be handled until you assign a service provider.")
     if len(waiters) >= 2 and tables:
-        with st.expander("Waiter on leave? Move all their tables to another waiter"):
+        with st.expander("Service Provider on leave? Move all their tables to another service provider"):
             ids = [w["id"] for w in waiters]
-            src = st.selectbox("From waiter", ids, format_func=lambda i: wname.get(i, "?"), key="mv_from")
+            src = st.selectbox("From service provider", ids, format_func=lambda i: wname.get(i, "?"), key="mv_from")
             dst_opts = [i for i in ids if i != src]
-            dst = st.selectbox("To waiter", dst_opts, format_func=lambda i: wname.get(i, "?"), key="mv_to")
+            dst = st.selectbox("To service provider", dst_opts, format_func=lambda i: wname.get(i, "?"), key="mv_to")
             st.caption("Open orders and requests of those tables move too. Completed orders keep their "
-                       "original waiter and commission.")
+                       "original service provider and commission.")
             if st.button("Move all tables", key="mv_go"):
                 ok, n = attempt(api.reassign_waiter_tables, src, dst)
                 if ok:
@@ -1445,10 +1581,10 @@ def page_tables(api) -> None:
                 opts = [None] + [w["id"] for w in waiters]
                 cur = tb.get("waiter_id") if tb.get("waiter_id") in opts else None
                 if tb.get("waiter_id") and cur is None:
-                    st.caption(f"Current waiter ({wname.get(tb['waiter_id'], '?')}) is inactive.")
+                    st.caption(f"Current service provider ({wname.get(tb['waiter_id'], '?')}) is inactive.")
                 w1, w2 = st.columns([3, 1])
-                pick = w1.selectbox("Waiter for this table", opts, index=opts.index(cur),
-                                    format_func=lambda i: "— no waiter —" if i is None else wname.get(i, "?"),
+                pick = w1.selectbox("Service Provider for this table", opts, index=opts.index(cur),
+                                    format_func=lambda i: "— no service provider —" if i is None else wname.get(i, "?"),
                                     key=f"tw_{tb['id']}")
                 if w2.button("Save", key=f"tws_{tb['id']}", disabled=(pick == tb.get("waiter_id"))):
                     ok, _ = attempt(api.assign_table_waiter, tb["id"], pick)
@@ -1481,16 +1617,16 @@ def page_tables(api) -> None:
 
 def page_staff(api) -> None:
     _title("staff")
-    tab_list, tab_new = st.tabs(["Waiters", "Add waiter"])
+    tab_list, tab_new = st.tabs(["Service Providers", "Add service provider"])
     with tab_new:
         with st.form("new_waiter"):
             name = st.text_input("Full name *")
             email = st.text_input("Email *")
             phone = st.text_input("Phone")
             pw = st.text_input("Temporary password *", type="password",
-                               help="Give it to the waiter privately. They can change it after signing in.")
+                               help="Give it to the service provider privately. They can change it after signing in.")
             pct = st.number_input("Commission (%)", min_value=0.0, max_value=100.0, step=0.5, value=0.0)
-            if st.form_submit_button("Create waiter account", type="primary"):
+            if st.form_submit_button("Create service provider account", type="primary"):
                 problem = ("Name is required." if not name.strip()
                            else "Enter a valid email." if "@" not in email else valid_password(pw))
                 if problem:
@@ -1499,18 +1635,23 @@ def page_staff(api) -> None:
                     ok, _ = attempt(api.create_employee, email.strip(), name.strip(), pw,
                                     phone.strip(), float(pct))
                     if ok:
-                        flash("Waiter account created.")
+                        flash("Service Provider account created.")
                         st.rerun()
     with tab_list:
         ok, emps = attempt(api.list_employees)
         if not ok:
             return
         if not emps:
-            st.info("No waiters yet.")
+            st.info("No service providers yet.")
         wname_of = {x["id"]: x["full_name"] for x in emps}
         for e in emps:
-            tag = "" if e.get("is_active", True) else " (inactive)"
+            removed = bool(e.get("removed_at"))
+            tag = " (removed)" if removed else ("" if e.get("is_active", True) else " (inactive)")
             with st.expander(f"{e['full_name']}{tag} — {e.get('commission_pct', 0)}% commission"):
+                if removed:
+                    st.caption("Removed. The login was deleted and the email is free to use again. "
+                               "The name stays in past sales and commission reports.")
+                    continue
                 st.caption(e.get("email") or "")
                 with st.form(f"emp_{e['id']}"):
                     name = st.text_input("Full name", value=e["full_name"])
@@ -1525,7 +1666,7 @@ def page_staff(api) -> None:
                             ok, _ = attempt(api.update_employee, e["id"], name.strip(), phone.strip(),
                                             float(pct), active)
                             if ok:
-                                flash("Waiter updated.")
+                                flash("Service Provider updated.")
                                 st.rerun()
                 if e.get("is_active", True):
                     ok_t, all_tables = attempt(api.list_tables)
@@ -1533,7 +1674,7 @@ def page_staff(api) -> None:
                     tname = {t["id"]: t["label"] for t in act}
                     taken = {t["id"]: t.get("waiter_id") for t in act}
                     mine_ids = [t["id"] for t in act if t.get("waiter_id") == e["id"]]
-                    chosen = st.multiselect("Tables this waiter looks after", list(tname), default=mine_ids,
+                    chosen = st.multiselect("Tables this service provider looks after", list(tname), default=mine_ids,
                                             format_func=lambda i: f"Table {tname[i]}"
                                             + (f" (now {wname_of.get(taken[i])})" if taken[i] and taken[i] != e["id"] else ""),
                                             key=f"wt_{e['id']}") if tname else []
@@ -1542,10 +1683,40 @@ def page_staff(api) -> None:
                         if ok:
                             flash(f"{e['full_name']} now looks after {n} table(s).")
                             st.rerun()
-                if e.get("email") and st.button("Send password reset email", key=f"pwr_{e['id']}"):
-                    ok, _ = attempt(api.send_password_reset, e["email"])
-                    if ok:
-                        st.success("Reset email sent.")
+                with st.expander("✉️ Change email"):
+                    with st.form(f"mail_{e['id']}", clear_on_submit=True):
+                        nmail = st.text_input("New email", help="The service provider signs in with this email from now on.")
+                        if st.form_submit_button("Change email"):
+                            if "@" not in nmail:
+                                st.error("Enter a valid email.")
+                            else:
+                                ok, _ = attempt(api.change_employee_email, e["id"], nmail.strip())
+                                if ok:
+                                    flash("Email changed.")
+                                    st.rerun()
+                with st.expander("🗑️ Remove service provider (resigned / left)"):
+                    st.warning("Their login is deleted and their email becomes free. Their name stays in past "
+                               "orders, sales and commission reports. Their tables become unassigned. "
+                               "This cannot be undone.")
+                    sure = st.checkbox("I understand", key=f"rm_c_{e['id']}")
+                    if st.button("Remove permanently", key=f"rm_{e['id']}", disabled=not sure):
+                        ok, _ = attempt(api.remove_employee, e["id"])
+                        if ok:
+                            flash(f"{e['full_name']} was removed.", "warning")
+                            st.rerun()
+                if e.get("email"):
+                    with st.expander("🔑 Set a new password for this service provider"):
+                        with st.form(f"pwr_{e['id']}", clear_on_submit=True):
+                            npw = st.text_input("New password", type="password",
+                                                help="Tell the service provider privately. They can sign in with it immediately.")
+                            if st.form_submit_button("Set new password"):
+                                problem = valid_password(npw)
+                                if problem:
+                                    st.error(problem)
+                                else:
+                                    ok, _ = attempt(api.reset_user_password, e["email"], npw)
+                                    if ok:
+                                        st.success(f"Password changed for {e['full_name']}.")
 
 
 def page_commission(api) -> None:
@@ -1557,9 +1728,9 @@ def page_commission(api) -> None:
     ok, emps = attempt(api.list_employees)
     if not ok:
         return
-    by_id = {e["id"]: e["full_name"] for e in emps}
-    wid = st.selectbox("Waiter", ["ALL"] + list(by_id),
-                       format_func=lambda i: "All waiters" if i == "ALL" else by_id[i])
+    by_id = {e["id"]: e["full_name"] + (" (removed)" if e.get("removed_at") else "") for e in emps}
+    wid = st.selectbox("Service Provider", ["ALL"] + list(by_id),
+                       format_func=lambda i: "All service providers" if i == "ALL" else by_id[i])
     wid = None if wid == "ALL" else wid
     tab_sum, tab_hist = st.tabs(["Summary", "History"])
     with tab_sum:
@@ -1569,13 +1740,13 @@ def page_commission(api) -> None:
             tot = rep["totals"]
             kpi_row([("Eligible sales", _money(tot["eligible_sales"])), ("Orders", str(tot["orders"])),
                      ("Commission earned", _money(tot["commission"]))])
-            show_table(rep["rows"], {"waiter": "Waiter", "commission_pct": "Rate %", "orders": "Orders",
+            show_table(rep["rows"], {"waiter": "Service Provider", "commission_pct": "Rate %", "orders": "Orders",
                                      "eligible_sales": "Eligible sales", "commission": "Commission"},
                        money=("eligible_sales", "commission"), empty="No eligible sales in this period.")
     with tab_hist:
         ok, rows = attempt(api.commission_history, start, end, wid)
         if ok:
-            show_table(rows, {"completed_at": "Completed", "order_number": "Order #", "waiter": "Waiter",
+            show_table(rows, {"completed_at": "Completed", "order_number": "Order #", "waiter": "Service Provider",
                               "base_amount": "Base amount", "commission_pct": "Rate %",
                               "commission": "Commission", "status": "Status"},
                        money=("base_amount", "commission"), dts=("completed_at",))
@@ -1699,6 +1870,24 @@ def page_expenses(api) -> None:
                 st.rerun()
 
 
+def _tips_section(api, tips: dict) -> None:
+    """Tips are shown apart from sales: they are not revenue and carry no commission."""
+    st.subheader("Tips")
+    st.caption("Tips are paid by customers on top of the bill. They are not counted in revenue or commission.")
+    kpi_row([("Service provider tips", _money(tips.get("waiter_total", 0))),
+             ("Kitchen tips received", _money(tips.get("kitchen_received", 0))),
+             ("Kitchen tips given", _money(tips.get("kitchen_given", 0))),
+             ("Kitchen tips to hand over", _money(tips.get("kitchen_pending", 0)))])
+    show_table(tips.get("by_waiter"), {"waiter": "Service Provider", "count": "Tips", "amount": "Amount"},
+               money=("amount",), empty="No service provider tips in this period.")
+    if float(tips.get("kitchen_pending") or 0) > 0:
+        if st.button(f"✅ I gave {_money(tips['kitchen_pending'])} to the kitchen", key="tips_given"):
+            ok, amount = attempt(api.mark_kitchen_tips_given)
+            if ok:
+                flash(f"{_money(amount)} marked as given to the kitchen.")
+                st.rerun()
+
+
 def page_analytics(api) -> None:
     _title("analytics", "Revenue is money received from sales. Profit is only estimated when cost data exists.")
     start, end = date_filter("ana", "Last 7 days")
@@ -1733,12 +1922,83 @@ def page_analytics(api) -> None:
         else:
             st.info("No data.")
     with c2:
-        st.subheader("Waiter-wise sales")
-        show_table(a.get("waiter_sales"), {"waiter": "Waiter", "orders": "Orders", "sales": "Sales"},
-                   money=("sales",), empty="No waiter sales.")
+        st.subheader("Service Provider-wise sales")
+        show_table(a.get("waiter_sales"), {"waiter": "Service Provider", "orders": "Orders", "sales": "Sales"},
+                   money=("sales",), empty="No service provider sales.")
+    st.subheader("How customers paid")
+    pm = a.get("payments_by_method") or []
+    for row in pm:
+        row["method_label"] = backend.BILL_METHODS.get(row["method"], row["method"])
+    show_table(pm, {"method_label": "Method", "orders": "Orders", "amount": "Amount"}, money=("amount",),
+               empty="No confirmed payments in this period.")
+    if a.get("unpaid_completed"):
+        st.warning(f"{a['unpaid_completed']} completed order(s) in this period have no confirmed payment.")
+    _tips_section(api, a.get("tips") or {})
     low = a.get("low_stock") or []
     if low:
         st.warning("Inventory alerts: " + ", ".join(i["name"] for i in low))
+
+
+def page_feedback(api) -> None:
+    _title("feedback", "What customers said. Use it to improve your restaurant. Only you can see this.")
+    start, end = date_filter("fb", "Last 30 days")
+    ok, f = attempt(api.list_feedback, start, end)
+    if not ok:
+        return
+    avg_all, avg_p = f.get("all_time_average"), f.get("period_average")
+    kpi_row([("Average rating (all time)", f"{float(avg_all):.1f} ⭐ ({f['all_time_count']})" if avg_all is not None else "—"),
+             ("Average rating (this period)", f"{float(avg_p):.1f} ⭐ ({f['period_count']})" if avg_p is not None else "—"),
+             ("Reviews this period", str(f["period_count"]))])
+    dist = f.get("distribution") or {}
+    if f["period_count"]:
+        total = max(int(f["period_count"]), 1)
+        for n in (5, 4, 3, 2, 1):
+            c = int(dist.get(str(n), 0))
+            st.progress(c / total, text=f"{'⭐' * n} — {c}")
+    rows = f.get("rows") or []
+    if not rows:
+        st.info("No feedback in this period yet.")
+        return
+    for r in rows:
+        with st.container(border=True):
+            c1, c2 = st.columns([5, 1])
+            c1.markdown(f"{'⭐' * int(r['rating'])}{'☆' * (5 - int(r['rating']))} · Table **{r.get('table_label') or '?'}**"
+                        + (f" · {r['waiter_name']}" if r.get("waiter_name") else "")
+                        + f" · {fmt_dt(r['created_at'])}")
+            if r.get("comment"):
+                c1.write(r["comment"])
+            with c2.popover("🗑️"):
+                st.caption("Delete this feedback permanently?")
+                if st.button("Delete", key=f"fbdel_{r['id']}"):
+                    ok, _ = attempt(api.delete_feedback, r["id"])
+                    if ok:
+                        flash("Feedback deleted.")
+                        st.rerun()
+
+
+def page_forecast(api) -> None:
+    _title("forecast", "A simple estimate of what to prepare tomorrow, based on the same weekday in the last 8 weeks.")
+    ok, d = attempt(api.demand_forecast)
+    if not ok:
+        return
+    items = d.get("items") or []
+    if not items:
+        st.info("Not enough sales yet. Forecasts appear after a few days of orders.")
+        return
+    kpi_row([("Forecast for", str(d.get("tomorrow") or "—")),
+             ("Expected orders", str(d.get("tomorrow_orders") if d.get("tomorrow_orders") is not None else "—"))])
+    rows = []
+    for i in items:
+        last7, prev7 = float(i.get("last_7") or 0), float(i.get("prev_7") or 0)
+        trend = "▲ up" if last7 > prev7 * 1.2 else ("▼ down" if last7 < prev7 * 0.8 else "• steady")
+        rows.append({"Dish": i["name"], "Expected tomorrow": float(i.get("tomorrow_qty") or 0),
+                     "Daily average": float(i.get("daily_avg") or 0), "Last 7 days": last7,
+                     "Trend vs week before": trend})
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+    days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+    st.subheader("Busiest days")
+    st.bar_chart({days[w["dow"]]: w["orders"] for w in d.get("weekdays") or []})
+    st.caption("This is an estimate from past sales, not a guarantee. Holidays and weather can change demand.")
 
 
 def page_subscription(api) -> None:
@@ -1840,6 +2100,8 @@ def page_my_stats(api) -> None:
         more.append(("Avg time to complete an order", f"{float(a['avg_minutes_to_complete']):g} min"))
     if a.get("avg_minutes_to_accept_request") is not None:
         more.append(("Avg time to accept a request", f"{float(a['avg_minutes_to_accept_request']):g} min"))
+    tips = a.get("tips") or {}
+    more.append(("Tips received", f"{_money(tips.get('total', 0))} ({tips.get('count', 0)})"))
     kpi_row(more)
 
     daily = a.get("daily") or []
@@ -1886,6 +2148,7 @@ def page_my_stats(api) -> None:
 # Routing table
 # ---------------------------------------------------------------------------
 PAGES = {
+    "payments": page_payments,
     "admin_overview": page_admin_overview, "admin_restaurants": page_admin_restaurants,
     "admin_plans": page_admin_plans, "admin_subscriptions": page_admin_subscriptions,
     "admin_payments": page_admin_payments, "admin_messages": page_admin_messages,
@@ -1895,5 +2158,5 @@ PAGES = {
     "commission": page_commission, "inventory": page_inventory, "expenses": page_expenses,
     "analytics": page_analytics, "restaurant": page_restaurant,
     "subscription": page_subscription, "messages": page_messages,
-    "my_stats": page_my_stats, "account": page_account,
+    "my_stats": page_my_stats, "account": page_account, "feedback": page_feedback, "forecast": page_forecast,
 }

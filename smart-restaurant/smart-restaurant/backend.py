@@ -37,7 +37,7 @@ DATABASE CONTRACT (implemented by database.sql - Part 3)
            admin_extend_subscription, admin_send_expiry_reminders,
            admin_review_payment, admin_send_message, admin_save_setting
   Edge Functions: admin-users (create_restaurant, assign_owner,
-           create_employee), ai-assistant (status, test, recommend)
+           create_employee, reset_password, change_email, remove_employee), ai-assistant (status, test, recommend)
   Storage: public bucket `restaurant-assets` (logos, menu images, folder per
            restaurant id) and private bucket `payment-proofs`.
   Customer link format: <CUSTOMER_APP_URL>/?t=<table token>
@@ -94,7 +94,7 @@ REQUEST_TRANSITIONS = {
     "cancelled": [],
 }
 REQUEST_TYPES = {
-    "call_waiter": "Call waiter",
+    "call_waiter": "Call service provider",
     "bill": "Request bill",
     "water": "Request water",
     "cutlery": "Request cutlery",
@@ -106,6 +106,8 @@ PAYMENT_STATUSES = ["pending", "approved", "rejected"]
 RESTAURANT_STATUSES = ["active", "suspended"]
 STOCK_KINDS = ["addition", "deduction"]
 COMMISSION_BASES = ["gross", "net"]
+BILL_STATUSES = ("pending", "approved", "rejected", "cancelled")
+BILL_METHODS = {"online": "Online (screenshot)", "cash": "Cash", "card": "Card"}
 
 AI_PROVIDERS = {"gemini": "Google Gemini"}
 DEFAULT_AI_PROVIDER = "gemini"
@@ -961,6 +963,14 @@ class SmartRestaurantAPI:
         for key in ("waiter_can_view_sales", "waiter_can_view_commission"):
             if key in fields:
                 row[key] = bool(fields[key])
+        if "late_discount_pct" in fields:
+            row["late_discount_pct"] = clean_amount(fields["late_discount_pct"], "Late-service discount", 0, 100)
+        if "cancel_window_minutes" in fields:
+            row["cancel_window_minutes"] = clean_int(fields["cancel_window_minutes"], "Cancel window", 0, 60)
+        if "terms_text" in fields:
+            row["terms_text"] = clean_text(fields["terms_text"], "Terms and conditions", 5000) or None
+        if "payment_instructions" in fields:
+            row["payment_instructions"] = clean_text(fields["payment_instructions"], "Payment instructions", 500) or None
         if "logo_url" in fields:
             row["logo_url"] = self._own_asset_url(fields["logo_url"], "Logo")
         if not row:
@@ -1027,6 +1037,11 @@ class SmartRestaurantAPI:
             "is_featured": bool(payload.get("is_featured")),
             "is_popular": bool(payload.get("is_popular")),
             "image_url": self._own_asset_url(payload.get("image_url"), "Image"),
+            "is_kids": bool(payload.get("is_kids")),
+            "is_family": bool(payload.get("is_family")),
+            "is_mild": bool(payload.get("is_mild")),
+            "prep_minutes": (clean_int(payload.get("prep_minutes"), "Preparation time", 1, 240)
+                             if payload.get("prep_minutes") else None),
         }
         return self._save_row("menu_items", payload.get("id"), row, "Product")
 
@@ -1062,7 +1077,7 @@ class SmartRestaurantAPI:
         self._need("owner")
         self._call("assign_table_waiter", {
             "p_table_id": clean_uuid(table_id, "Table"),
-            "p_waiter_id": clean_uuid(waiter_id, "Waiter") if waiter_id else None,
+            "p_waiter_id": clean_uuid(waiter_id, "Service Provider") if waiter_id else None,
         })
 
     def set_waiter_tables(self, waiter_id, table_ids) -> int:
@@ -1070,14 +1085,14 @@ class SmartRestaurantAPI:
         self._need("owner")
         ids = [clean_uuid(t, "Table") for t in (table_ids or [])]
         return int(self._call("set_waiter_tables", {
-            "p_waiter_id": clean_uuid(waiter_id, "Waiter"), "p_table_ids": ids}) or 0)
+            "p_waiter_id": clean_uuid(waiter_id, "Service Provider"), "p_table_ids": ids}) or 0)
 
     def reassign_waiter_tables(self, from_waiter_id, to_waiter_id) -> int:
         """Waiter on leave: move ALL of their tables (and open orders) to another waiter."""
         self._need("owner")
         return int(self._call("reassign_waiter_tables", {
-            "p_from_waiter": clean_uuid(from_waiter_id, "Waiter"),
-            "p_to_waiter": clean_uuid(to_waiter_id, "Waiter")}) or 0)
+            "p_from_waiter": clean_uuid(from_waiter_id, "Service Provider"),
+            "p_to_waiter": clean_uuid(to_waiter_id, "Service Provider")}) or 0)
 
     def customer_base_url(self) -> str:
         url = _secret("CUSTOMER_APP_URL").rstrip("/")
@@ -1166,6 +1181,20 @@ class SmartRestaurantAPI:
                                              "p_new_status": new_status})
 
     # =======================================================================
+    # BILLS AND PAYMENTS (customer asks to pay; the service provider or owner confirms)
+    # =======================================================================
+    def list_payments(self, status="pending", limit=50) -> list[dict]:
+        self._need("owner", "waiter")
+        if status not in BILL_STATUSES + ("all",):
+            raise AppError("Invalid payment filter.")
+        return self._call("list_payments", {"p_status": status, "p_limit": clean_int(limit, "Limit", 1, 200)}) or []
+
+    def decide_payment(self, payment_id, approve, reason=None) -> None:
+        self._need("owner", "waiter")
+        self._call("decide_payment", {"p_payment_id": clean_uuid(payment_id, "Payment"), "p_approve": bool(approve),
+                                      "p_reason": clean_text(reason, "Reason", 200) or None})
+
+    # =======================================================================
     # EMPLOYEES AND COMMISSION
     # =======================================================================
     def list_employees(self) -> list[dict]:
@@ -1173,6 +1202,11 @@ class SmartRestaurantAPI:
         res = self._exec(self._table("restaurant_employees").select("*").eq("restaurant_id", self._rid())
                          .order("full_name"))
         return res.data or []
+
+    def cancel_flags(self) -> list[dict]:
+        """Tables with 3+ customer cancellations in 24 hours (possible fake orders). Owner only."""
+        self._need("owner")
+        return self._call("cancel_flags") or []
 
     def create_employee(self, email, full_name, password, phone, commission_pct) -> dict:
         self._need("owner")
@@ -1183,6 +1217,31 @@ class SmartRestaurantAPI:
             "password": check_password(password),
             "phone": clean_text(phone, "Phone", 30),
             "commission_pct": clean_amount(commission_pct, "Commission", 0, 100),
+        })
+
+    def reset_user_password(self, email, new_password) -> None:
+        """Owner resets a waiter's password; Super Admin resets an owner's. Checked again server-side."""
+        self._need("owner", "super_admin")
+        self._edge("admin-users", {
+            "action": "reset_password",
+            "email": clean_email(email),
+            "password": check_password(new_password),
+        })
+
+    def change_employee_email(self, employee_id, new_email) -> None:
+        self._need("owner")
+        self._edge("admin-users", {
+            "action": "change_email",
+            "employee_id": clean_uuid(employee_id, "Service provider"),
+            "email": clean_email(new_email),
+        })
+
+    def remove_employee(self, employee_id) -> None:
+        """Deletes the login but keeps the record (name, commission history) for reports."""
+        self._need("owner")
+        self._edge("admin-users", {
+            "action": "remove_employee",
+            "employee_id": clean_uuid(employee_id, "Service provider"),
         })
 
     def update_employee(self, employee_id, full_name, phone, commission_pct, is_active) -> None:
@@ -1198,7 +1257,7 @@ class SmartRestaurantAPI:
         self._need("owner")
         data = self._call("commission_report", {
             "p_from": as_iso_date(date_from), "p_to": as_iso_date(date_to),
-            "p_waiter_id": clean_uuid(waiter_id, "Waiter") if waiter_id else None,
+            "p_waiter_id": clean_uuid(waiter_id, "Service Provider") if waiter_id else None,
         })
         report = _with_defaults(data, {"basis": "gross", "rows": [], "totals": {}})
         report["totals"] = _with_defaults(report["totals"], {"eligible_sales": 0, "orders": 0, "commission": 0})
@@ -1208,7 +1267,7 @@ class SmartRestaurantAPI:
         self._need("owner")
         return self._call("commission_history", {
             "p_from": as_iso_date(date_from), "p_to": as_iso_date(date_to),
-            "p_waiter_id": clean_uuid(waiter_id, "Waiter") if waiter_id else None,
+            "p_waiter_id": clean_uuid(waiter_id, "Service Provider") if waiter_id else None,
         }) or []
 
     # =======================================================================
@@ -1301,7 +1360,32 @@ class SmartRestaurantAPI:
             "orders": 0, "completed": 0, "cancelled": 0, "revenue": 0, "avg_order_value": 0,
             "expenses": 0, "estimated_profit": None,
         })
+        result["tips"] = _with_defaults(result.get("tips"), {
+            "waiter_total": 0, "kitchen_received": 0, "kitchen_given": 0, "kitchen_pending": 0, "by_waiter": [],
+        })
         return result
+
+    def mark_kitchen_tips_given(self) -> float:
+        """Owner hands the kitchen tips received so far to the kitchen. Returns the amount."""
+        self._need("owner")
+        return float(self._call("mark_kitchen_tips_given") or 0)
+
+    def list_feedback(self, date_from, date_to) -> dict:
+        self._need("owner")
+        return _with_defaults(self._call("list_feedback", {
+            "p_from": as_iso_date(date_from), "p_to": as_iso_date(date_to)}), {
+            "all_time_average": None, "all_time_count": 0, "period_average": None, "period_count": 0,
+            "distribution": {}, "rows": [],
+        })
+
+    def demand_forecast(self) -> dict:
+        self._need("owner")
+        return _with_defaults(self._call("demand_forecast", {}), {
+            "tomorrow": None, "tomorrow_orders": None, "items": [], "weekdays": []})
+
+    def delete_feedback(self, feedback_id) -> None:
+        self._need("owner")
+        self._call("delete_feedback", {"p_id": clean_uuid(feedback_id, "Feedback")})
 
     def waiter_stats(self, date_from, date_to) -> dict:
         self._need("waiter", "owner")
@@ -1320,6 +1404,7 @@ class SmartRestaurantAPI:
             "avg_order_value": None, "refunded_orders": 0, "commission_reversed": None,
             "avg_minutes_to_complete": None, "avg_minutes_to_accept_request": None,
             "daily": [], "top_items": [], "by_table": [], "by_hour": [],
+            "tips": {"total": 0, "count": 0},
         })
 
     # =======================================================================

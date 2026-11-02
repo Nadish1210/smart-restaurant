@@ -146,7 +146,7 @@ Tick each item after you see it work.
 **Login and roles**
 - [ ] Super Admin, Owner and Waiter each see only their own menu pages.
 - [ ] A wrong password shows a clear error.
-- [ ] "Forgot password" email arrives and the link opens the "set new password" screen.
+- [ ] Owner: Staff > a waiter > "Set a new password" works and the waiter can sign in with it. Super Admin: Restaurants > "Set a new password for the owner" works. (Re-deploy the `admin-users` function first.) The login page "Forgot password" tab only shows instructions; it sends no email.
 - [ ] A deactivated user cannot sign in or keeps no access.
 
 **Customer ordering**
@@ -196,7 +196,7 @@ I ran these in a development sandbox:
 - `node --test tests/customer_core.test.js`: 11 customer-logic tests, **passed**.
 - `node --test tests/edge_functions.test.js`: 17 tests of the Edge Function logic using fake database and Gemini clients, **passed**.
 - `tests/test_backend.py`: 21 passed, 1 skipped (run with a small stand-in runner because `pytest` could not be installed there).
-- `database.sql` loaded on a local Postgres 16 with small stand-ins for Supabase's `auth` and `storage` schemas, and `tests/test_database.py` passed 333 of 333 checks (tenant isolation, role limits, order rules, refunds, subscriptions, table-wise waiter assignment).
+- `database.sql` loaded on a local Postgres 16 with small stand-ins for Supabase's `auth` and `storage` schemas, and `tests/test_database.py` passed 345 of 345 checks (tenant isolation, role limits, order rules, refunds, subscriptions, table-wise waiter assignment).
 - The customer page was exercised in headless Chromium against the real SQL functions through a small local shim.
 
 **Not tested** (you must verify these yourself with the checklist above):
@@ -213,6 +213,8 @@ I ran these in a development sandbox:
 
 **Built**
 - Table-wise waiters: each table belongs to one waiter (a waiter has many tables). Orders and requests go to that table's waiter, who is the only waiter who sees them and who earns the commission. The Owner can reassign a table, or move all of a waiter's tables when they are on leave. The Owner does not assign individual orders.
+- Super Admin overview shows only the platform's own numbers: restaurants, subscriptions, pending payments and the income from approved subscription payments. It never shows any restaurant's orders or sales.
+- Waiter "My Statistics": orders handled, sales, commission and rate, average order, refunds and reversed commission, daily trend charts, best-selling dishes and busiest tables at their own tables, busiest hours, and how fast they complete orders and accept requests. The owner can hide the money figures per restaurant (on by default for new restaurants).
 - Three roles with database-enforced permissions (Row Level Security, column-level grants, role checks inside functions).
 - QR table ordering with server-calculated prices and totals, duplicate-submission protection, and per-table throttling.
 - Order status workflow, waiter requests, menu, tables, expenses, staff, commissions, refunds, and revenue reports (Pakistan time).
@@ -249,7 +251,7 @@ node --test tests/customer_core.test.js
 node --test tests/edge_functions.test.js     # needs Node 22.6 or newer
 pip install pytest && pytest tests/test_backend.py
 ```
-Database tests (a throwaway local Postgres 16 on Linux only, never your Supabase project). The setup commands are at the top of `tests/test_database.py`; the last line it prints is `333/333 checks passed` when everything works.
+Database tests (a throwaway local Postgres 16 on Linux only, never your Supabase project). The setup commands are at the top of `tests/test_database.py`; the last line it prints is `524/524 checks passed` when everything works.
 Run `node --test` with the file path, not with the folder name.
 
 ---
@@ -267,3 +269,25 @@ Run `node --test` with the file path, not with the folder name.
 | Customer page blank, console shows blocked requests | `_headers` CSP allows only `*.supabase.co`. If you use a custom Supabase domain, add it to `connect-src`. |
 | AI suggestions never appear | AI switched off, no `GEMINI_API_KEY` secret, or `ENABLE_AI` is false. The basic suggestion still works. |
 | Emails are slow or missing | Built-in Supabase email is rate-limited. Add SMTP. |
+
+
+## Service Providers (waiters)
+The screens say "Service Provider"; the role is still `waiter` in the database. Owners can change a provider's email and **remove** one: the login is deleted and the email is freed, while the name stays in past sales and commission reports (shown as "(removed)"). Re-deploy the `admin-users` Edge Function and re-run `database.sql` after updating.
+
+## Service promise (preparation time, late discount, cancel window)
+- **Menu > product > Preparation time (minutes):** shown to customers ("about 15 min"). An order's promised time is its slowest dish. Leave 0 to show nothing.
+- **Restaurant Profile > Service promise:** *Late-service discount %* (0 = off) and *Customer can cancel within (minutes)* (0 = off). Both are shown to customers before and after ordering, and to service providers on each order card (time left / LATE).
+- If an order is served after its promised time, the % is taken off automatically **when it is marked Served**, only if the bill is still unpaid at that moment (a paid or pending payment is never changed). The discount appears on the customer's order and bill, and commission on the "net" basis uses the discounted total.
+- A customer can cancel only before the kitchen starts preparing, inside the window, and not if a payment was started. Limit: 2 cancellations per table per hour. The owner sees a warning on the Orders page for tables with 3+ customer cancellations in 24 hours.
+- After updating: re-run `database.sql` in the Supabase SQL Editor, upload the changed files; the customer page redeploys from GitHub automatically.
+
+## Tips and customer feedback
+- **Tips (customer):** on the Bill tab, before paying, the customer can add a tip for the service provider (named) or the kitchen (Rs. 50 / 100 / 200 or any amount). It is paid together with the bill and shown on the PDF bill. A tip must be added while there is an unpaid bill (it cannot be added after everything is paid).
+- **Tips (staff):** the service provider sees "Includes a tip of ..." on the payment to approve. After approval the tip is saved under that provider's name (their My Statistics shows "Tips received"). Kitchen tips are kept separate. Tips are never counted in revenue or commission.
+- **Owner > Sales Analytics > Tips:** provider tips by name, kitchen tips received / given / waiting to hand over, and the button "I gave Rs. X to the kitchen".
+- **Feedback:** customers rate 1-5 stars with an optional comment (one per table per 3 hours, only after an order). **Owner > Customer Feedback** shows the average rating (all time and for the period), the star breakdown and every comment, and the owner can delete any feedback. Service providers cannot see feedback.
+
+## Kids / family filters, upselling and demand forecast
+- **Menu tags:** in Menu > product form the owner can tick *Kids meal*, *Family deal* and *Mild spice*. Customers get quick filter chips (👶 Kids, 👨‍👩‍👧 Family, 🌿 Mild) only when at least one dish has that tag.
+- **Upselling:** when the customer's order has a main dish but no drink or dessert, the order sheet shows "Add a drink or dessert?" with up to 2 available suggestions of each (popular first). Nothing is added without a tap.
+- **Demand forecast (owner only):** *Demand Forecast* page shows expected quantity per dish for tomorrow (average of the same weekday over the last 8 weeks), expected orders, trend against the week before and the busiest weekdays. It is an estimate, not a guarantee.
