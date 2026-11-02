@@ -36,11 +36,11 @@
     served: "Served", completed: "Completed", cancelled: "Cancelled"
   };
   var REQUEST_TYPES = [
-    ["call_waiter", "🙋 Call waiter"], ["bill", "🧾 Request bill"], ["water", "💧 Water"],
+    ["call_waiter", "🙋 Call service provider"], ["bill", "🧾 Request bill"], ["water", "💧 Water"],
     ["cutlery", "🍴 Cutlery"], ["assistance", "❓ Need assistance"], ["other", "✍️ Something else"]
   ];
   var REQUEST_STATUS_TEXT = {
-    pending: "Waiting for a waiter", accepted: "A waiter is coming", in_progress: "On the way",
+    pending: "Waiting for a service provider", accepted: "A service provider is coming", in_progress: "On the way",
     completed: "Done", cancelled: "Cancelled"
   };
 
@@ -166,9 +166,86 @@
     return { ok: false, reason: "budget", minimum: last.total };
   }
 
+  // Upselling: if the order has a main dish but no drink / dessert, suggest up to 2 of each.
+  function upsellFor(menu, cart, limit) {
+    var roleByCat = {};
+    menu.categories.forEach(function (c) { roleByCat[c.id] = roleOf(c.name); });
+    var byId = {};
+    menu.items.forEach(function (i) { byId[i.id] = i; });
+    var has = { main: false, drink: false, dessert: false };
+    cart.forEach(function (l) { var it = byId[l.id]; if (it) has[roleByCat[it.category_id] || "main"] = true; });
+    if (!has.main && !has.side) return [];
+    var out = [];
+    ["drink", "dessert"].forEach(function (role) {
+      if (has[role]) return;
+      menu.items.filter(function (i) { return i.is_available && roleByCat[i.category_id] === role; })
+        .sort(function (a, b) { return ((b.is_popular ? 2 : 0) + (b.is_featured ? 1 : 0)) - ((a.is_popular ? 2 : 0) + (a.is_featured ? 1 : 0)) || Number(a.price) - Number(b.price); })
+        .slice(0, limit || 2).forEach(function (i) { out.push({ role: role, item: i }); });
+    });
+    return out;
+  }
+
   function popularItems(menu, limit) {
     return menu.items.filter(function (i) { return i.is_available && (i.is_popular || i.is_featured); })
       .sort(function (a, b) { return (b.is_popular ? 1 : 0) - (a.is_popular ? 1 : 0); }).slice(0, limit || 6);
+  }
+
+  // ---- bill helpers -------------------------------------------------------------------
+  function billOrders(orders) {
+    return (orders || []).filter(function (o) { return o && o.status !== "cancelled" && !o.refunded; });
+  }
+  // Orders that still need paying: not paid, not cancelled, and not already inside a pending payment.
+  function payableOrders(orders, payments) {
+    var inPending = {};
+    (payments || []).forEach(function (p) {
+      if (p && p.status === "pending") (p.order_ids || []).forEach(function (id) { inPending[id] = true; });
+    });
+    return billOrders(orders).filter(function (o) { return !o.paid_at && !inPending[o.order_id]; });
+  }
+  function sumTotals(list) {
+    var cents = 0;
+    (list || []).forEach(function (o) { cents += Math.round(Number(o.total) * 100) || 0; });
+    return cents / 100;
+  }
+  function billState(orders) {
+    var live = billOrders(orders);
+    if (!live.length) return "none";
+    var paid = live.filter(function (o) { return o.paid_at; }).length;
+    return paid === live.length ? "paid" : (paid === 0 ? "unpaid" : "partial");
+  }
+  var METHOD_TEXT = { online: "Online payment", cash: "Cash", card: "Card" };
+
+  // ---- tip helpers ------------------------------------------------------------------------
+  function openTips(tips) {
+    return (tips || []).filter(function (t) { return t && t.status === "open" && !t.in_payment; });
+  }
+  function sumAmounts(list) {
+    var cents = 0;
+    (list || []).forEach(function (t) { cents += Math.round(Number(t.amount) * 100) || 0; });
+    return cents / 100;
+  }
+  function tipLabel(t) {
+    return t.recipient === "kitchen" ? "Kitchen" : "Service provider" + (t.waiter_name ? " (" + t.waiter_name + ")" : "");
+  }
+
+  // ---- service promise helpers -----------------------------------------------------------
+  // The promised time of a cart is the slowest dish (dishes are cooked together).
+  function cartPromise(cart, itemsById) {
+    var m = null;
+    (cart || []).forEach(function (l) {
+      var it = itemsById && itemsById[l.id];
+      var p = it ? Number(it.prep_minutes) : 0;
+      if (p > 0 && (m === null || p > m)) m = p;
+    });
+    return m;
+  }
+  // Minutes left before an order is late (negative = late). null when there is no promise or it is over.
+  function promiseLeft(o, nowMs) {
+    if (!o || !(Number(o.promised_minutes) > 0)) return null;
+    if (["served", "completed", "cancelled"].indexOf(o.status) >= 0) return null;
+    var t = Date.parse(o.created_at);
+    if (isNaN(t)) return null;
+    return Number(o.promised_minutes) - (nowMs - t) / 60000;
   }
 
   function randomKey() {
@@ -184,8 +261,10 @@
 
   var core = {
     validToken: validToken, formatPkr: formatPkr, roleOf: roleOf, cartTotal: cartTotal, cartCount: cartCount,
-    reconcileCart: reconcileCart, cartSignature: cartSignature, suggestMeal: suggestMeal,
-    popularItems: popularItems, clampInt: clampInt
+    reconcileCart: reconcileCart, cartSignature: cartSignature, suggestMeal: suggestMeal, upsellFor: upsellFor,
+    popularItems: popularItems, clampInt: clampInt, billOrders: billOrders, payableOrders: payableOrders,
+    sumTotals: sumTotals, billState: billState, cartPromise: cartPromise, promiseLeft: promiseLeft,
+    openTips: openTips, sumAmounts: sumAmounts, tipLabel: tipLabel
   };
   root.SRCore = core;
   if (typeof module !== "undefined" && module.exports) module.exports = core;
@@ -197,8 +276,10 @@
 
   var CFG = root.SMART_RESTAURANT_CONFIG || {};
   var state = {
-    token: "", menu: null, itemsById: {}, category: "all", search: "", tab: "menu",
+    token: "", menu: null, itemsById: {}, category: "all", tag: "", search: "", tab: "menu",
     cart: [], orderNote: "", orderIds: [], orders: [], requests: [], placing: false,
+    payments: [], paymentIds: [], payMethod: "", proof: null, paying: false,
+    tips: [], tipIds: [], tipTo: "waiter", tipAmt: "", fbRating: 0, fbComment: "", fbBusy: false,
     key: null, keySig: "", cartMessage: "", aiBusy: false, suggestion: null, aiResult: null, lastMenuAt: 0
   };
   var $ = function (id) { return document.getElementById(id); };
@@ -322,6 +403,13 @@
     };
     make("all", "All");
     state.menu.categories.forEach(function (c) { make(c.id, c.name); });
+    [["is_kids", "👶 Kids"], ["is_family", "👨‍👩‍👧 Family"], ["is_mild", "🌿 Mild"]].forEach(function (t) {
+      if (!state.menu.items.some(function (i) { return i[t[0]]; })) return;
+      box.appendChild(h("button", {
+        type: "button", class: "chip", "aria-pressed": String(state.tag === t[0]), text: t[1],
+        onclick: function () { state.tag = state.tag === t[0] ? "" : t[0]; renderChips(); renderMenu(); }
+      }));
+    });
   }
 
   function qtyInCart(id) {
@@ -359,7 +447,8 @@
       h("div", null,
         h("div", null, item.is_featured ? h("span", { class: "badge", text: "⭐ Featured" }) : null, item.is_popular ? h("span", { class: "badge", text: "🔥 Popular" }) : null),
         h("h3", { text: item.name }),
-        item.description ? h("p", { class: "desc", text: item.description }) : null),
+        item.description ? h("p", { class: "desc", text: item.description }) : null,
+        Number(item.prep_minutes) > 0 ? h("p", { class: "small", text: "⏱ about " + item.prep_minutes + " min" }) : null),
       h("div", { class: "actions" }, h("span", { class: "price", text: formatPkr(item.price) }), stepper(item)));
   }
 
@@ -369,6 +458,7 @@
     var q = state.search.trim().toLowerCase();
     var items = state.menu.items.filter(function (i) {
       if (state.category !== "all" && i.category_id !== state.category) return false;
+      if (state.tag && !i[state.tag]) return false;
       return !q || (i.name + " " + (i.description || "")).toLowerCase().indexOf(q) >= 0;
     });
     if (!items.length) {
@@ -397,6 +487,16 @@
       return;
     }
     if (state.cartMessage) body.appendChild(h("div", { class: "notice", role: "alert", text: state.cartMessage }));
+    var ups = upsellFor(state.menu, state.cart, 2);
+    if (ups.length) {
+      var up = h("div", { class: "card", style: "margin-bottom:10px" }, h("strong", { text: "Add a drink or dessert?" }));
+      ups.forEach(function (u) {
+        up.appendChild(h("div", { class: "row", style: "align-items:center;justify-content:space-between;margin-top:6px" },
+          h("span", { text: (u.role === "drink" ? "🥤 " : "🍰 ") + u.item.name + " · " + formatPkr(u.item.price) }),
+          h("button", { type: "button", class: "secondary", text: "Add", onclick: function () { setQty(u.item, 1); } })));
+      });
+      body.appendChild(up);
+    }
     state.cart.forEach(function (line) {
       var item = state.itemsById[line.id];
       var price = item ? Number(item.price) : line.seen_price;
@@ -417,6 +517,15 @@
     body.appendChild(h("textarea", { id: "orderNote", maxlength: "500", placeholder: "Allergies, serving preferences...", oninput: function (e) { state.orderNote = e.target.value; } }, state.orderNote));
     $("orderNote").value = state.orderNote;
     body.appendChild(h("div", { class: "total" }, h("span", { text: "Total" }), h("span", { text: formatPkr(cartTotal(state.cart, state.itemsById)) })));
+    var promise = cartPromise(state.cart, state.itemsById), rest = state.menu.restaurant;
+    if (promise) {
+      var msg = "⏱ Your order should be served in about " + promise + " minutes.";
+      if (Number(rest.late_discount_pct) > 0) msg += " If it is later than that, you get " + Number(rest.late_discount_pct) + "% off (when the bill is still unpaid at serving).";
+      body.appendChild(h("div", { class: "notice ok", text: msg }));
+    }
+    if (Number(rest.cancel_window_minutes) > 0) {
+      body.appendChild(h("p", { class: "small", text: "You can cancel within " + rest.cancel_window_minutes + " minutes of ordering, before the kitchen starts preparing." }));
+    }
     body.appendChild(h("p", { class: "small", text: "Prices are checked again by the restaurant when you place the order. Pay at the table as usual." }));
     body.appendChild(h("div", { id: "orderError", class: "error", role: "alert" }));
     body.appendChild(h("button", { id: "placeBtn", type: "button", class: "primary wide", text: state.placing ? "Sending..." : "Place order", disabled: state.placing, onclick: placeOrder }));
@@ -480,6 +589,22 @@
       .catch(function () { /* keep showing the last known state */ });
   }
 
+  function promiseNote(o) {
+    var left = promiseLeft(o, Date.now());
+    if (left === null) return null;
+    var pct = Number(o.late_discount_pct) || 0;
+    if (left >= 0) return h("p", { class: "small", text: "⏱ Promised in " + o.promised_minutes + " min · about " + Math.ceil(left) + " min left" });
+    return h("p", { class: "small", text: "⏱ Running late." + (pct > 0 ? " You get " + pct + "% off when it is served (if the bill is unpaid)." : "") });
+  }
+
+  function cancelOrder(o) {
+    if (!root.confirm("Cancel order #" + o.order_number + "?")) return;
+    rpc("customer_cancel_order", { p_token: state.token, p_order_id: o.order_id })
+      .then(function () { toast("Order cancelled."); })
+      .catch(function (err) { toast(err.message); })
+      .then(refreshOrders);
+  }
+
   function renderOrders() {
     var box = $("ordersBody");
     clear(box);
@@ -494,9 +619,307 @@
       box.appendChild(h("article", { class: "card", style: "margin-bottom:10px" },
         h("div", { class: "order-head" }, h("h3", { text: "Order #" + o.order_number }), h("span", { class: "status " + o.status, text: STATUS_TEXT[o.status] || o.status })),
         steps,
+        o.paid_at ? h("p", { class: "small", text: "✅ Paid · " + (METHOD_TEXT[o.payment_method] || "") }) : null,
+        promiseNote(o),
         h("ul", { class: "plain" }, (o.items || []).map(function (it) { return h("li", null, h("span", { text: it.quantity + " × " + it.name }), h("span", { text: formatPkr(it.line_total) })); })),
-        h("div", { class: "total" }, h("span", { text: "Total" }), h("span", { text: formatPkr(o.total) }))));
+        Number(o.discount) > 0 ? h("div", { class: "total" }, h("span", { text: "Late-service discount (" + Number(o.late_discount_pct) + "%)" }), h("span", { text: "− " + formatPkr(o.discount) })) : null,
+        h("div", { class: "total" }, h("span", { text: "Total" }), h("span", { text: formatPkr(o.total) })),
+        o.cancel_until ? h("button", { type: "button", class: "secondary", style: "margin-top:8px", text: "Cancel this order (until " + new Date(o.cancel_until).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) + ")", onclick: function () { cancelOrder(o); } }) : null));
     });
+  }
+
+  // ---- bill and payment ------------------------------------------------------------------
+  function refreshPayments() {
+    if (!state.paymentIds.length) { state.payments = []; return Promise.resolve(); }
+    return rpc("customer_get_payments", { p_token: state.token, p_ids: state.paymentIds })
+      .then(function (list) { state.payments = list || []; })
+      .catch(function () { /* keep the last known state */ });
+  }
+  function refreshTips() {
+    if (!state.tipIds.length) { state.tips = []; return Promise.resolve(); }
+    return rpc("customer_get_tips", { p_token: state.token, p_ids: state.tipIds })
+      .then(function (list) { state.tips = list || []; })
+      .catch(function () { /* keep the last known state */ });
+  }
+  function addTip() {
+    var amt = Number(state.tipAmt);
+    if (!(amt >= 1)) { toast("Enter a tip amount."); return; }
+    rpc("customer_add_tip", { p_token: state.token, p_recipient: state.tipTo, p_amount: amt })
+      .then(function (r) {
+        if (state.tipIds.indexOf(r.tip_id) < 0) { state.tipIds = [r.tip_id].concat(state.tipIds).slice(0, 20); save("tips", state.tipIds); }
+        state.tipAmt = ""; toast("Tip added to your bill.");
+      })
+      .catch(function (err) { toast(err.message); })
+      .then(refreshBill);
+  }
+  function removeTip(id) {
+    rpc("customer_remove_tip", { p_token: state.token, p_id: id })
+      .then(function () { toast("Tip removed."); })
+      .catch(function (err) { toast(err.message); })
+      .then(refreshBill);
+  }
+  function sendFeedback() {
+    if (state.fbBusy) return;
+    if (!(state.fbRating >= 1)) { toast("Please choose 1 to 5 stars."); return; }
+    state.fbBusy = true; renderBill();
+    rpc("customer_submit_feedback", { p_token: state.token, p_rating: state.fbRating, p_comment: state.fbComment.trim() || null })
+      .then(function () { save("feedback_at", Date.now()); state.fbRating = 0; state.fbComment = ""; toast("Thank you for your feedback!"); })
+      .catch(function (err) { toast(err.message); })
+      .then(function () { state.fbBusy = false; renderBill(); });
+  }
+  function refreshBill() {
+    return Promise.all([refreshOrders(), refreshPayments(), refreshTips()]).then(function () { if (state.tab === "bill") renderBill(); });
+  }
+
+  // Shrinks a screenshot to a small JPEG so it uploads quickly on mobile data.
+  function compressImage(file) {
+    return new Promise(function (resolve, reject) {
+      if (!file || !/^image\//.test(file.type)) { reject(new Error("Please choose a photo or screenshot.")); return; }
+      var fr = new FileReader();
+      fr.onerror = function () { reject(new Error("Could not read that image.")); };
+      fr.onload = function () {
+        var img = new Image();
+        img.onerror = function () { reject(new Error("That file is not a usable image.")); };
+        img.onload = function () {
+          var k = Math.min(1, 1280 / Math.max(img.width, img.height));
+          var c = document.createElement("canvas");
+          c.width = Math.max(1, Math.round(img.width * k)); c.height = Math.max(1, Math.round(img.height * k));
+          var g = c.getContext("2d");
+          g.fillStyle = "#fff"; g.fillRect(0, 0, c.width, c.height); g.drawImage(img, 0, 0, c.width, c.height);
+          var q = 0.8, out = c.toDataURL("image/jpeg", q);
+          while (out.length > 650000 && q > 0.3) { q -= 0.1; out = c.toDataURL("image/jpeg", q); }
+          if (out.length > 650000) reject(new Error("That image is too large. Please send a smaller screenshot."));
+          else resolve(out);
+        };
+        img.src = fr.result;
+      };
+      fr.readAsDataURL(file);
+    });
+  }
+
+  function submitPayment(due) {
+    if (state.paying) return;
+    var method = state.payMethod;
+    if (!method) { toast("Please choose how you want to pay."); return; }
+    if (method === "online" && !state.proof) { toast("Please attach your payment screenshot first."); return; }
+    state.paying = true; renderBill();
+    rpc("customer_create_payment", {
+      p_token: state.token, p_order_ids: due.map(function (o) { return o.order_id; }),
+      p_method: method, p_proof: method === "online" ? state.proof : null,
+      p_tip_ids: openTips(state.tips).map(function (t) { return t.tip_id; })
+    }).then(function (r) {
+      state.paymentIds = [r.payment_id].concat(state.paymentIds).slice(0, 10);
+      save("payments", state.paymentIds);
+      state.payMethod = ""; state.proof = null;
+      toast("Sent. Your service provider will confirm it.");
+    }).catch(function (err) { toast(err.message); })
+      .then(function () { state.paying = false; return refreshBill(); });
+  }
+
+  function cancelPayment(id) {
+    rpc("customer_cancel_payment", { p_token: state.token, p_id: id })
+      .then(function () { toast("Payment request cancelled."); })
+      .catch(function (err) { toast(err.message); })
+      .then(refreshBill);
+  }
+
+  function whenText(iso) { try { return new Date(iso).toLocaleString(); } catch (e) { return ""; } }
+
+  function renderBill() {
+    var box = $("billBody");
+    clear(box);
+    var live = billOrders(state.orders);
+    if (!live.length) {
+      box.appendChild(h("p", { class: "muted", text: "Your bill will appear here after you place an order." }));
+      return;
+    }
+    var due = payableOrders(state.orders, state.payments);
+    var pending = state.payments.filter(function (p) { return p.status === "pending"; });
+
+    pending.forEach(function (p) {
+      box.appendChild(h("div", { class: "notice" },
+        h("strong", { text: "⏳ Waiting for confirmation" }),
+        h("p", { class: "small", style: "margin:4px 0 8px", text: (METHOD_TEXT[p.method] || p.method) + " · " + formatPkr(p.amount) + ". Your service provider will confirm it shortly." }),
+        h("button", { type: "button", class: "secondary", text: "Cancel this payment", onclick: function () { cancelPayment(p.payment_id); } })));
+    });
+
+    var rejected = state.payments.filter(function (p) { return p.status === "rejected"; })[0];
+    if (rejected && due.length) {
+      box.appendChild(h("div", { class: "notice" }, h("strong", { text: "Your last payment was not accepted." }),
+        h("p", { class: "small", style: "margin:4px 0 0", text: (rejected.reject_reason ? rejected.reject_reason + " " : "") + "Please try again or call your service provider." })));
+    }
+
+    if (due.length) {
+      box.appendChild(h("h3", { class: "section-title", text: "To pay" }));
+      var card = h("article", { class: "card" });
+      due.forEach(function (o) {
+        card.appendChild(h("div", { class: "line" }, h("span", { text: "Order #" + o.order_number + " · " + STATUS_TEXT[o.status] }), h("span", { text: formatPkr(o.total) })));
+      });
+      var openT = openTips(state.tips), tipSum = sumAmounts(openT);
+      var payTotal = Math.round((sumTotals(due) + tipSum) * 100) / 100;
+      openT.forEach(function (t) {
+        card.appendChild(h("div", { class: "line" }, h("span", { text: "💝 Tip · " + tipLabel(t) }), h("span", { text: formatPkr(t.amount) }),
+          h("button", { type: "button", class: "link", text: "Remove", onclick: function () { removeTip(t.tip_id); } })));
+      });
+      card.appendChild(h("div", { class: "total" }, h("span", { text: "Total to pay" }), h("span", { text: formatPkr(payTotal) })));
+      box.appendChild(card);
+      box.appendChild(tipBox(live));
+
+      var grid = h("div", { class: "pay-grid" });
+      [["online", "📲 Pay online (send screenshot)"], ["cash", "💵 Pay cash"], ["card", "💳 Pay by card"]].forEach(function (m) {
+        grid.appendChild(h("button", { type: "button", "aria-pressed": String(state.payMethod === m[0]), text: m[1], onclick: function () {
+          state.payMethod = m[0]; state.proof = null; renderBill();
+        } }));
+      });
+      box.appendChild(grid);
+
+      if (state.payMethod === "online") {
+        var info = state.menu.restaurant.payment_instructions;
+        box.appendChild(h("div", { class: "card", style: "margin-top:10px" },
+          h("strong", { text: "1. Send " + formatPkr(payTotal) + " to the restaurant" }),
+          h("p", { class: "pre", text: info || "Ask your service provider for the account details." }),
+          h("strong", { text: "2. Attach the screenshot of your payment" }),
+          h("input", { type: "file", accept: "image/*", style: "margin-top:8px", onchange: function (e) {
+            compressImage(e.target.files && e.target.files[0]).then(function (url) { state.proof = url; renderBill(); })
+              .catch(function (err) { toast(err.message); });
+          } }),
+          state.proof ? h("img", { class: "proof-preview", src: state.proof, alt: "Your payment screenshot" }) : null));
+      } else if (state.payMethod === "cash") {
+        box.appendChild(h("div", { class: "notice ok" }, "Keep " + formatPkr(payTotal) + " ready. Your service provider will come to collect it and confirm the payment."));
+      } else if (state.payMethod === "card") {
+        box.appendChild(h("div", { class: "notice ok" }, "Your service provider will bring the card machine. Confirm below and they will come to your table."));
+      }
+      if (state.payMethod) {
+        box.appendChild(h("button", { type: "button", class: "primary wide", style: "margin-top:12px", disabled: state.paying || (state.payMethod === "online" && !state.proof),
+          text: state.paying ? "Sending..." : (state.payMethod === "online" ? "Send payment proof" : "Tell my service provider"),
+          onclick: function () { submitPayment(due); } }));
+      }
+    } else if (!pending.length) {
+      box.appendChild(h("div", { class: "notice ok", text: "✅ Everything is paid. Thank you!" }));
+    }
+
+    var paid = live.filter(function (o) { return o.paid_at; });
+    if (paid.length) {
+      box.appendChild(h("h3", { class: "section-title", text: "Paid" }));
+      var pc = h("article", { class: "card" });
+      paid.forEach(function (o) {
+        pc.appendChild(h("div", { class: "line" },
+          h("span", { text: "Order #" + o.order_number }),
+          h("span", { text: formatPkr(o.total) }),
+          h("span", { class: "small note", text: "✅ Payment received · " + (METHOD_TEXT[o.payment_method] || "") + " · " + whenText(o.paid_at) })));
+      });
+      box.appendChild(pc);
+    }
+    var rcv = (state.tips || []).filter(function (t) { return t.status === "received"; });
+    if (rcv.length) {
+      var tc = h("article", { class: "card", style: "margin-top:10px" });
+      rcv.forEach(function (t) {
+        tc.appendChild(h("div", { class: "line" }, h("span", { text: "💝 Tip · " + tipLabel(t) }), h("span", { text: formatPkr(t.amount) }),
+          h("span", { class: "small note", text: "✅ Received · thank you!" })));
+      });
+      box.appendChild(tc);
+    }
+    box.appendChild(h("button", { type: "button", class: "secondary wide", style: "margin-top:14px;width:100%", text: "🧾 View and save bill (PDF)", onclick: showBill }));
+    box.appendChild(feedbackBox());
+  }
+
+  function tipBox(live) {
+    var prov = "";
+    live.forEach(function (o) { if (!prov && o.waiter_name) prov = o.waiter_name; });
+    var wrap = h("div", { class: "card", style: "margin-top:10px" }, h("strong", { text: "💝 Add a tip (optional)" }));
+    var who = h("div", { class: "pay-grid", style: "margin-top:8px" });
+    [["waiter", "Service provider" + (prov ? " (" + prov + ")" : "")], ["kitchen", "👨‍🍳 Kitchen"]].forEach(function (r) {
+      who.appendChild(h("button", { type: "button", "aria-pressed": String(state.tipTo === r[0]), text: r[1], onclick: function () { state.tipTo = r[0]; renderBill(); } }));
+    });
+    wrap.appendChild(who);
+    var amts = h("div", { class: "pay-grid", style: "margin-top:8px" });
+    [50, 100, 200].forEach(function (a) {
+      amts.appendChild(h("button", { type: "button", "aria-pressed": String(String(state.tipAmt) === String(a)), text: "Rs. " + a, onclick: function () { state.tipAmt = String(a); renderBill(); } }));
+    });
+    wrap.appendChild(amts);
+    wrap.appendChild(h("input", { type: "number", min: "1", max: "100000", step: "10", inputmode: "numeric", placeholder: "Other amount (Rs.)", style: "margin-top:8px", value: state.tipAmt,
+      oninput: function (e) { state.tipAmt = e.target.value; } }));
+    wrap.appendChild(h("button", { type: "button", class: "secondary", style: "margin-top:8px", text: "Add tip to my bill", onclick: addTip }));
+    wrap.appendChild(h("p", { class: "small", text: "Tips are paid together with your bill. They are not part of the food bill." }));
+    return wrap;
+  }
+
+  function feedbackBox() {
+    var sent = Number(load("feedback_at", 0)) || 0;
+    if (sent && Date.now() - sent < 3 * 3600 * 1000) {
+      return h("div", { class: "notice ok", style: "margin-top:14px", text: "⭐ Thank you for your feedback!" });
+    }
+    var stars = h("div", { class: "pay-grid", style: "margin-top:8px" });
+    [1, 2, 3, 4, 5].forEach(function (n) {
+      stars.appendChild(h("button", { type: "button", "aria-label": n + " star" + (n > 1 ? "s" : ""), "aria-pressed": String(state.fbRating === n), text: (state.fbRating >= n ? "★" : "☆") + " " + n, onclick: function () { state.fbRating = n; renderBill(); } }));
+    });
+    return h("div", { class: "card", style: "margin-top:14px" },
+      h("strong", { text: "How was your visit?" }), stars,
+      h("textarea", { maxlength: "500", placeholder: "Tell us more (optional)", style: "margin-top:8px", oninput: function (e) { state.fbComment = e.target.value; } }, state.fbComment),
+      h("button", { type: "button", class: "primary", style: "margin-top:8px", disabled: state.fbBusy, text: state.fbBusy ? "Sending..." : "Send feedback", onclick: sendFeedback }));
+  }
+
+  // ---- info sheet: bill and terms -----------------------------------------------------------
+  function openInfo(title, nodes) {
+    $("infoTitle").textContent = title;
+    var b = $("infoBody"); clear(b);
+    [].concat(nodes).forEach(function (n) { if (n) b.appendChild(n); });
+    $("infoSheet").hidden = false;
+  }
+  function closeInfo() { $("infoSheet").hidden = true; }
+
+  function showTerms() {
+    var t = state.menu && state.menu.restaurant.terms;
+    openInfo("Terms & Conditions", h("p", { class: "pre", text: t || "This restaurant has not added its terms and conditions yet." }));
+  }
+
+  function showBill() {
+    var r = state.menu.restaurant, live = billOrders(state.orders), stt = billState(state.orders);
+    var seen = {}, providers = [];
+    live.forEach(function (o) { if (o.waiter_name && !seen[o.waiter_name]) { seen[o.waiter_name] = 1; providers.push(o.waiter_name); } });
+    var paid = live.filter(function (o) { return o.paid_at; });
+    var methods = [], mseen = {};
+    paid.forEach(function (o) { var m = METHOD_TEXT[o.payment_method]; if (m && !mseen[m]) { mseen[m] = 1; methods.push(m); } });
+    var lastPaid = paid.map(function (o) { return o.paid_at; }).sort().slice(-1)[0];
+    var table = h("table");
+    live.slice().reverse().forEach(function (o) {
+      table.appendChild(h("tr", null, h("td", { colspan: "2" }, h("strong", { text: "Order #" + o.order_number + " · " + whenText(o.created_at) }))));
+      (o.items || []).forEach(function (it) {
+        table.appendChild(h("tr", null, h("td", { text: it.quantity + " × " + it.name }), h("td", { text: formatPkr(it.line_total) })));
+      });
+      if (Number(o.discount) > 0) table.appendChild(h("tr", null, h("td", { text: "Late-service discount (" + Number(o.late_discount_pct) + "%)" }), h("td", { text: "− " + formatPkr(o.discount) })));
+    });
+    var billTips = state.tips || [];
+    billTips.forEach(function (t) {
+      table.appendChild(h("tr", null, h("td", { text: "Tip · " + tipLabel(t) + (t.status === "received" ? " (received)" : "") }), h("td", { text: formatPkr(t.amount) })));
+    });
+    var tipTotal = sumAmounts(billTips);
+    var stamp = stt === "paid" ? h("span", { class: "stamp", text: "PAYMENT RECEIVED" })
+      : stt === "partial" ? h("span", { class: "stamp unpaid", text: "PARTLY PAID" })
+      : h("span", { class: "stamp unpaid", text: "NOT PAID YET" });
+    var logo = r.logo_url && /^https:\/\//.test(r.logo_url) ? h("img", { class: "logo", src: r.logo_url, alt: "", referrerpolicy: "no-referrer" }) : null;
+    var paidTotal = sumTotals(paid);
+    var node = h("div", { class: "bill" },
+      h("div", { class: "bill-head" }, logo, h("div", null, h("h2", { text: r.name || "Restaurant" }), r.phone ? h("p", { class: "small", text: r.phone }) : null)),
+      h("p", { class: "small", text: "Bill · " + new Date().toLocaleString() }),
+      h("p", { text: "Table " + (state.menu.table.label || "") + (providers.length ? " · Service provider: " + providers.join(", ") : "") }),
+      h("hr"), table, h("hr"),
+      h("div", { class: "total" }, h("span", { text: tipTotal > 0 ? "Food total" : "Total" }), h("span", { text: formatPkr(sumTotals(live)) })),
+      tipTotal > 0 ? h("div", { class: "total" }, h("span", { text: "Total with tip" }), h("span", { text: formatPkr(sumTotals(live) + tipTotal) })) : null,
+      stt === "partial" ? h("p", { class: "small", text: "Paid " + formatPkr(paidTotal) + " · Still to pay " + formatPkr(sumTotals(live) - paidTotal) }) : null,
+      h("p", null, stamp),
+      paid.length ? h("p", { class: "small", text: "Paid by " + methods.join(", ") + (lastPaid ? " on " + whenText(lastPaid) : "") }) : null,
+      h("p", { class: "small", text: "Thank you for dining with us." }),
+      h("div", { class: "row no-print", style: "margin-top:12px" },
+        h("button", { type: "button", class: "primary", text: "Save as PDF / Print", onclick: function () {
+          var old = document.title;
+          document.title = (r.name || "Restaurant") + " - Bill";
+          root.print();
+          setTimeout(function () { document.title = old; }, 1500);
+        } }),
+        h("button", { type: "button", class: "secondary", text: "Close", onclick: closeInfo })),
+      h("p", { class: "small no-print", text: "Tip: in the print window choose “Save as PDF” as the printer." }));
+    openInfo("Your bill", node);
   }
 
   // ---- help / requests -------------------------------------------------------------
@@ -508,7 +931,7 @@
 
   function sendRequest(type, note) {
     return rpc("customer_create_request", { p_token: state.token, p_type: type, p_note: note || null })
-      .then(function (r) { toast(r.duplicate ? "A waiter has already been notified." : "A waiter has been notified."); return refreshRequests(); })
+      .then(function (r) { toast(r.duplicate ? "A service provider has already been notified." : "A service provider has been notified."); return refreshRequests(); })
       .catch(function (err) { toast(err.message); });
   }
 
@@ -516,7 +939,7 @@
     var box = $("helpBody");
     var keep = $("otherNote") ? $("otherNote").value : "";
     clear(box);
-    box.appendChild(h("p", { class: "muted", text: "Tap a button and a waiter will come to your table." }));
+    box.appendChild(h("p", { class: "muted", text: "Tap a button and a service provider will come to your table." }));
     var grid = h("div", { class: "help-grid", style: "margin-top:10px" });
     REQUEST_TYPES.forEach(function (rt) {
       if (rt[0] === "other") return;
@@ -644,11 +1067,12 @@
   // ---- tabs, polling, start-up ------------------------------------------------------------
   function switchTab(tab) {
     state.tab = tab;
-    ["menu", "suggest", "orders", "help"].forEach(function (t) {
+    ["menu", "suggest", "orders", "bill", "help"].forEach(function (t) {
       $("view-" + t).hidden = t !== tab;
       $("tab-" + t).setAttribute("aria-selected", String(t === tab));
     });
     if (tab === "orders") refreshOrders();
+    if (tab === "bill") { renderBill(); refreshBill(); }
     if (tab === "help") refreshRequests();
     if (tab === "suggest") renderSuggest();
   }
@@ -657,7 +1081,11 @@
 
   function tick() {
     if (document.hidden || state.placing) return;
+    // Do not redraw the bill while the customer is typing a tip or a comment.
+    var ae = document.activeElement;
+    if (state.tab === "bill" && ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA")) return;
     if (state.tab === "orders") refreshOrders();
+    else if (state.tab === "bill") refreshBill();
     else if (state.tab === "help") refreshRequests();
     else if (state.tab === "menu" && Date.now() - state.lastMenuAt > 90000 && $("sheet").hidden) {
       loadMenu().then(function () {
@@ -689,6 +1117,8 @@
       state.cart = rec.cart;
       if (rec.removed.length || rec.changed.length) state.cartMessage = "Your saved order was updated to match today's menu.";
       state.orderIds = (load("orders", []) || []).filter(function (id) { return typeof id === "string"; }).slice(0, 10);
+      state.paymentIds = (load("payments", []) || []).filter(function (id) { return typeof id === "string"; }).slice(0, 10);
+      state.tipIds = (load("tips", []) || []).filter(function (id) { return typeof id === "string"; }).slice(0, 20);
       $("fatal").hidden = true;
       $("app").hidden = false;
       renderAll();
@@ -704,8 +1134,11 @@
   $("search").addEventListener("input", function (e) { state.search = e.target.value; renderMenu(); });
   $("openCart").addEventListener("click", function () { renderSheet(); openSheet(); });
   $("closeSheet").addEventListener("click", closeSheet);
+  $("closeInfo").addEventListener("click", closeInfo);
+  $("openTerms").addEventListener("click", showTerms);
+  $("infoSheet").addEventListener("click", function (e) { if (e.target === $("infoSheet")) closeInfo(); });
   $("sheet").addEventListener("click", function (e) { if (e.target === $("sheet")) closeSheet(); });
-  document.addEventListener("keydown", function (e) { if (e.key === "Escape" && !$("sheet").hidden) closeSheet(); });
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape") { if (!$("sheet").hidden) closeSheet(); if (!$("infoSheet").hidden) closeInfo(); } });
   setInterval(tick, 8000);
   start();
 })(typeof window !== "undefined" ? window : globalThis);
