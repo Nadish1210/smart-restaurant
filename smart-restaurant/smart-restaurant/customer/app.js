@@ -185,6 +185,24 @@
     return out;
   }
 
+  // A new visit starts when this phone has been idle on this table for 6 hours,
+  // so an old bill or order from a previous meal is never shown to the next guest.
+  function isNewVisit(lastSeen, now, hours) {
+    var t = Number(lastSeen);
+    if (!isFinite(t) || t <= 0) return true;
+    return now - t > (hours || 6) * 3600000;
+  }
+
+  // Once a bill is paid it stays visible for a few minutes (to save the PDF), then disappears,
+  // so the next guest at the table never sees it. field = the time the item was settled.
+  function dropSettled(list, field, now, minutes) {
+    var limit = (minutes || 3) * 60000;
+    return (list || []).filter(function (x) {
+      var t = x && x[field] ? Date.parse(x[field]) : NaN;
+      return !(isFinite(t) && now - t > limit);
+    });
+  }
+
   function popularItems(menu, limit) {
     return menu.items.filter(function (i) { return i.is_available && (i.is_popular || i.is_featured); })
       .sort(function (a, b) { return (b.is_popular ? 1 : 0) - (a.is_popular ? 1 : 0); }).slice(0, limit || 6);
@@ -261,7 +279,7 @@
 
   var core = {
     validToken: validToken, formatPkr: formatPkr, roleOf: roleOf, cartTotal: cartTotal, cartCount: cartCount,
-    reconcileCart: reconcileCart, cartSignature: cartSignature, suggestMeal: suggestMeal, upsellFor: upsellFor,
+    reconcileCart: reconcileCart, cartSignature: cartSignature, suggestMeal: suggestMeal, upsellFor: upsellFor, isNewVisit: isNewVisit, dropSettled: dropSettled,
     popularItems: popularItems, clampInt: clampInt, billOrders: billOrders, payableOrders: payableOrders,
     sumTotals: sumTotals, billState: billState, cartPromise: cartPromise, promiseLeft: promiseLeft,
     openTips: openTips, sumAmounts: sumAmounts, tipLabel: tipLabel
@@ -585,7 +603,15 @@
   function refreshOrders() {
     if (!state.orderIds.length) { state.orders = []; renderOrders(); return Promise.resolve(); }
     return rpc("customer_get_orders", { p_token: state.token, p_order_ids: state.orderIds })
-      .then(function (list) { state.orders = list || []; renderOrders(); })
+      .then(function (list) {
+        var all = list || [];
+        state.orders = dropSettled(all, "paid_at", Date.now(), 3);
+        if (state.orders.length !== all.length) {
+          var keep = {}; state.orders.forEach(function (o) { keep[o.order_id] = true; });
+          state.orderIds = state.orderIds.filter(function (id) { return keep[id]; }); save("orders", state.orderIds);
+        }
+        renderOrders();
+      })
       .catch(function () { /* keep showing the last known state */ });
   }
 
@@ -632,13 +658,28 @@
   function refreshPayments() {
     if (!state.paymentIds.length) { state.payments = []; return Promise.resolve(); }
     return rpc("customer_get_payments", { p_token: state.token, p_ids: state.paymentIds })
-      .then(function (list) { state.payments = list || []; })
+      .then(function (list) {
+        var all = list || [];
+        var old = dropSettled(all.filter(function (p) { return p.status === "approved"; }), "decided_at", Date.now(), 3);
+        state.payments = all.filter(function (p) { return p.status !== "approved" || old.indexOf(p) >= 0; });
+        if (state.payments.length !== all.length) {
+          var keep = {}; state.payments.forEach(function (p) { keep[p.payment_id] = true; });
+          state.paymentIds = state.paymentIds.filter(function (id) { return keep[id]; }); save("payments", state.paymentIds);
+        }
+      })
       .catch(function () { /* keep the last known state */ });
   }
   function refreshTips() {
     if (!state.tipIds.length) { state.tips = []; return Promise.resolve(); }
     return rpc("customer_get_tips", { p_token: state.token, p_ids: state.tipIds })
-      .then(function (list) { state.tips = list || []; })
+      .then(function (list) {
+        var all = list || [];
+        state.tips = dropSettled(all, "received_at", Date.now(), 3);
+        if (state.tips.length !== all.length) {
+          var keep = {}; state.tips.forEach(function (t) { keep[t.tip_id] = true; });
+          state.tipIds = state.tipIds.filter(function (id) { return keep[id]; }); save("tips", state.tipIds);
+        }
+      })
       .catch(function () { /* keep the last known state */ });
   }
   function addTip() {
@@ -1080,6 +1121,7 @@
   function renderAll() { renderHeader(); renderChips(); renderMenu(); renderCartBar(); if (!$("sheet").hidden) renderSheet(); }
 
   function tick() {
+    if (Date.now() - (load("seen", 0) || 0) > 60000) save("seen", Date.now());
     if (document.hidden || state.placing) return;
     // Do not redraw the bill while the customer is typing a tip or a comment.
     var ae = document.activeElement;
@@ -1116,6 +1158,11 @@
       var rec = reconcileCart(state.cart, state.menu.items);
       state.cart = rec.cart;
       if (rec.removed.length || rec.changed.length) state.cartMessage = "Your saved order was updated to match today's menu.";
+      if (isNewVisit(load("seen", 0), Date.now(), 6)) {
+        ["orders", "payments", "tips", "cart", "feedback_at"].forEach(function (k) { save(k, k === "feedback_at" ? 0 : []); });
+        state.cart = [];
+      }
+      save("seen", Date.now());
       state.orderIds = (load("orders", []) || []).filter(function (id) { return typeof id === "string"; }).slice(0, 10);
       state.paymentIds = (load("payments", []) || []).filter(function (id) { return typeof id === "string"; }).slice(0, 10);
       state.tipIds = (load("tips", []) || []).filter(function (id) { return typeof id === "string"; }).slice(0, 20);
