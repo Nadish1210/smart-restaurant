@@ -82,6 +82,8 @@ class SmartRestaurantAPI():
 from __future__ import annotations
 
 import base64
+import json
+import time
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -337,25 +339,48 @@ def valid_password(password: str) -> str | None:
     return None
 
 
-BEEP_JS = """<script>
-try{const C=window.AudioContext||window.webkitAudioContext;const c=new C();
-const o=c.createOscillator();const g=c.createGain();o.connect(g);g.connect(c.destination);
-o.frequency.value=880;g.gain.value=0.15;o.start();setTimeout(function(){o.stop();c.close();},350);}catch(e){}
+# Alert tunes (Web Audio, no files needed). "order" = bell-like ding-dong, "request" = quick triple beep.
+_TUNES = {
+    "order": [(880, 0.00, 0.45), (660, 0.45, 0.45), (880, 0.90, 0.45), (660, 1.35, 0.60)],
+    "request": [(1175, 0.00, 0.16), (1175, 0.24, 0.16), (1175, 0.48, 0.16), (1397, 0.72, 0.35)],
+}
+
+
+def _beep_js(kind: str) -> str:
+    notes = json.dumps(_TUNES.get(kind, _TUNES["order"]))
+    return """<script>
+try{const C=window.AudioContext||window.webkitAudioContext;const c=new C();if(c.resume){c.resume();}
+const notes=""" + notes + """;let end=0;
+notes.forEach(function(n){const o=c.createOscillator();const g=c.createGain();
+o.type="triangle";o.frequency.value=n[0];o.connect(g);g.connect(c.destination);
+const t=c.currentTime+n[1];g.gain.setValueAtTime(0.0001,t);g.gain.exponentialRampToValueAtTime(0.6,t+0.02);
+g.gain.exponentialRampToValueAtTime(0.0001,t+n[2]);o.start(t);o.stop(t+n[2]+0.05);end=Math.max(end,n[1]+n[2]);});
+setTimeout(function(){try{c.close();}catch(e){}},(end+0.4)*1000);}catch(e){}
 </script>"""
 
 
-def play_alert() -> None:
-    """Short beep. Browsers may block sound until the user has tapped the page once."""
-    components.html(BEEP_JS, height=0)
+def play_alert(kind: str = "order") -> None:
+    """Plays an alert tune. Browsers may block sound until the user has tapped the page once."""
+    components.html(_beep_js(kind), height=0)
 
 
-def _alert_if_increased(key: str, count: int, message: str, sound: bool) -> None:
+REPEAT_SECONDS = 30
+
+
+def _alert_if_increased(key: str, count: int, message: str, sound: bool, kind: str = "order") -> None:
+    """Rings when the count goes up, and keeps ringing every 30 seconds while something is still waiting."""
     previous = st.session_state.get(key)
     st.session_state[key] = count
+    now = time.time()
+    last = st.session_state.get(key + "_rang", 0.0)
     if previous is not None and count > previous:
         st.toast(message, icon="🔔")
         if sound:
-            play_alert()
+            play_alert(kind)
+            st.session_state[key + "_rang"] = now
+    elif count > 0 and sound and now - last >= REPEAT_SECONDS:
+        play_alert(kind)
+        st.session_state[key + "_rang"] = now
 
 
 # ---------------------------------------------------------------------------
@@ -391,14 +416,25 @@ def inject_theme() -> None:
 # ---------------------------------------------------------------------------
 # Setup / login / recovery
 # ---------------------------------------------------------------------------
+
+def show_logo(width: int = 120) -> None:
+    """Shows the Smart Restaurant logo if assets/logo.png exists (otherwise nothing)."""
+    from pathlib import Path
+    p = Path(__file__).parent / "assets" / "logo.png"
+    if p.exists():
+        st.image(str(p), width=width)
+
+
 def render_setup_help(message: str) -> None:
-    st.title("🍽️ Smart Restaurant")
+    show_logo(110)
+    st.title("Smart Restaurant")
     st.error("The application is not configured yet.")
     st.markdown(message)
 
 
 def render_no_access(api) -> None:
-    st.title("🍽️ Smart Restaurant")
+    show_logo(110)
+    st.title("Smart Restaurant")
     st.warning(
         "Your account is signed in but has no active role. Please contact your "
         "restaurant owner or the platform administrator."
@@ -422,7 +458,8 @@ def sign_out(api, message: str | None = None) -> None:
 def render_login(api) -> None:
     _, mid, _ = st.columns([1, 2, 1])
     with mid:
-        st.markdown(f"# 🍽️ {t('app_name')}")
+        show_logo(150)
+        st.markdown(f"# {t('app_name')}")
         st.caption(t("app_tagline"))
         show_flash()
         settings = {}
@@ -460,7 +497,8 @@ def render_login(api) -> None:
 def render_recovery(api, token_hash: str) -> None:
     _, mid, _ = st.columns([1, 2, 1])
     with mid:
-        st.markdown(f"# 🍽️ {t('app_name')}")
+        show_logo(150)
+        st.markdown(f"# {t('app_name')}")
         st.subheader("Set a new password")
         if not st.session_state.get("_recovery_ok"):
             with st.spinner("Verifying your reset link..."):
@@ -500,7 +538,8 @@ def allowed_pages(role: str, gate: dict) -> list[str]:
 def render_sidebar(api, pages: list[str], gate: dict) -> str:
     ctx = api.ctx
     with st.sidebar:
-        st.markdown(f"## 🍽️ {t('app_name')}")
+        show_logo(90)
+        st.markdown(f"## {t('app_name')}")
         st.caption(f"{ctx.get('restaurant_name') or 'Platform'}  \n"
                    f"{ctx.get('full_name') or ctx.get('email')} · {ROLE_TITLES.get(ctx['role'], '')}")
         if st.session_state.get("nav_page") not in pages:
@@ -1064,7 +1103,7 @@ def _order_card(api, o: dict, prefix: str, allow_cancel: bool) -> None:
 def _live_orders(api, key: str, statuses: list[str], group: bool, allow_cancel: bool) -> None:
     c1, c2, c3 = st.columns([2, 2, 2])
     auto = c1.toggle("Auto-refresh (10s)", value=True, key=f"{key}_auto")
-    sound = c2.toggle("🔔 Sound alert", value=False, key=f"{key}_sound",
+    sound = c2.toggle("🔔 Sound alert", value=True, key=f"{key}_sound",
                       help="Your browser may need one tap on the page before it allows sound.")
     mine = False  # waiters only receive the orders of their own tables (enforced by the database)
     if api.ctx["role"] == "waiter":
@@ -1073,7 +1112,7 @@ def _live_orders(api, key: str, statuses: list[str], group: bool, allow_cancel: 
                              key=lambda x: (len(x), x)) if ok_t else []
         c3.caption("Your tables: " + (", ".join(mine_tables) if mine_tables else "none yet. Ask the owner."))
     if sound and st.button("Test sound", key=f"{key}_testsound"):
-        play_alert()
+        play_alert("order")
 
     @st.fragment(run_every=10 if auto else None)
     def board() -> None:
@@ -1200,7 +1239,7 @@ def page_requests(api) -> None:
     with tab_live:
         c1, c2 = st.columns(2)
         auto = c1.toggle("Auto-refresh (10s)", value=True, key="req_auto")
-        sound = c2.toggle("🔔 Sound alert", value=False, key="req_sound",
+        sound = c2.toggle("🔔 Sound alert", value=True, key="req_sound",
                           help="Your browser may need one tap on the page before it allows sound.")
 
         @st.fragment(run_every=10 if auto else None)
@@ -1209,7 +1248,7 @@ def page_requests(api) -> None:
             if not ok:
                 return
             pending = sum(1 for r in rows if r["status"] == "pending")
-            _alert_if_increased("req_seen", pending, "A customer needs assistance!", sound)
+            _alert_if_increased("req_seen", pending, "A customer needs assistance!", sound, "request")
             st.caption(f"{len(rows)} open request(s) · updated {datetime.now(TZ):%I:%M:%S %p}")
             if not rows:
                 st.info("No open requests.")
